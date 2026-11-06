@@ -1,0 +1,17 @@
+# dkr360: never the game, its data or builds
+*.z64
+*.n64
+*.v64
+*.rom
+*.bin
+*.o2r
+*.xex
+*.elf
+*.raw
+*.wav
+*.ppm
+*.png
+*.log
+dkr360/
+build/
+work/

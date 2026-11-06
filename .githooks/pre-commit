@@ -1,0 +1,21 @@
+#!/bin/sh
+# dkr360: refuses commits holding the game (ROM dumps, save or extracted data) or builds.
+bad=$(git diff --cached --name-only --diff-filter=ACMR | grep -Ei "\.(z64|n64|v64|rom|bin|o2r|xex|elf|raw|wav|ppm)$|(^|/)dkr360/saves/")
+if [ -n "$bad" ]; then
+	echo "pre-commit: these look like game data or builds and must not be committed:" >&2
+	echo "$bad" >&2
+	exit 1
+fi
+# A file this big is game data or a build, whatever its name (the patch and the font header are well under).
+for f in $(git diff --cached --name-only --diff-filter=ACMR); do
+	if [ -f "$f" ] && [ "$(wc -c <"$f")" -gt 4000000 ]; then
+		echo "pre-commit: $f is over 4 MB; not committed" >&2
+		exit 1
+	fi
+	# An N64 ROM header in any byte order
+	if [ -f "$f" ] && head -c 4 "$f" | od -An -tx1 | tr -d " \n" | grep -Eq "^(80371240|37804012|40123780)$"; then
+		echo "pre-commit: $f is an N64 ROM; not committed" >&2
+		exit 1
+	fi
+done
+exit 0

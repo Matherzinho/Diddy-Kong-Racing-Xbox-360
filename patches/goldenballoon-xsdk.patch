@@ -1,0 +1,704 @@
+diff --git a/game/src/audio.c b/game/src/audio.c
+index d6494261..f86b5d59 100644
+--- a/game/src/audio.c
++++ b/game/src/audio.c
+@@ -145,10 +145,12 @@ void audio_init(OSSched *sc) {
+     gSoundCount = gSoundTableSize / sizeof(SoundData);
+     /* SoundData.soundBite (the ALInstrument sound index) and .range are u16 and
+      * big-endian in ROM; the sfx players and spatial audio read them directly. */
++#ifndef MDKR_HOST_BIG_ENDIAN /* dkr360: the ROM's order is the host's on a big-endian host */
+     for (i = 0; i < gSoundCount; i++) {
+         gSoundTable[i].soundBite = (u16) ((gSoundTable[i].soundBite << 8) | (gSoundTable[i].soundBite >> 8));
+         gSoundTable[i].range = (u16) ((gSoundTable[i].range << 8) | (gSoundTable[i].range >> 8));
+     }
++#endif
+ 
+     gSeqSoundTableSize = addrPtr[ASSET_AUDIO_6] - addrPtr[ASSET_AUDIO_5];
+     gSeqSoundTable = (MusicData *) mempool_alloc_safe(gSeqSoundTableSize, COLOUR_TAG_CYAN);
+@@ -1702,6 +1704,7 @@ void music_sequence_init(ALCSPlayer *seqp, void *sequence, u8 *seqID, ALCSeq *se
+          * each track and compute qnpt, so byte-swap the 68-byte header in place.
+          * The MIDI event stream itself is byte-oriented (running status + VLQ
+          * delta times assembled byte-by-byte) and needs no swap. */
++#ifndef MDKR_HOST_BIG_ENDIAN /* dkr360: the ROM's order is the host's on a big-endian host */
+         {
+             u32 *hdr = (u32 *) sequence;
+             s32 w;
+@@ -1711,6 +1714,7 @@ void music_sequence_init(ALCSPlayer *seqp, void *sequence, u8 *seqID, ALCSeq *se
+                          ((v >> 8) & 0xFF00) | ((v >> 24) & 0xFF);
+             }
+         }
++#endif
+ #endif
+         alCSeqNew(seq, sequence);
+         alCSPSetSeq(seqp, seq);
+diff --git a/game/src/game_text.c b/game/src/game_text.c
+index d0583905..11014cff 100644
+--- a/game/src/game_text.c
++++ b/game/src/game_text.c
+@@ -482,6 +482,7 @@ void set_current_text(s32 textID) {
+          * asset_table_load() path (it swaps word 0 for asset_table_size). The four
+          * words just DMA'd here are still big-endian, so swap them before the
+          * flags/offset masks below read them. */
++#ifndef MDKR_HOST_BIG_ENDIAN /* dkr360: the ROM's order is the host's on a big-endian host */
+         {
+             s32 mdkrI;
+             for (mdkrI = 0; mdkrI < 4; mdkrI++) {
+@@ -489,6 +490,7 @@ void set_current_text(s32 textID) {
+                 entries[mdkrI] = ((v & 0xFFu) << 24) | ((v & 0xFF00u) << 8) | ((v >> 8) & 0xFF00u) | ((v >> 24) & 0xFFu);
+             }
+         }
++#endif
+ #endif
+         temp = ((s32) entries[textID & 1]) & 0xFF000000;
+         size = (((s32) entries[(textID & 1) + 1]) & 0xFFFFFF) - (((s32) entries[textID & 1]) & 0xFFFFFF);
+diff --git a/game/src/memory.c b/game/src/memory.c
+index 1116049f..79058ac8 100644
+--- a/game/src/memory.c
++++ b/game/src/memory.c
+@@ -226,6 +226,43 @@ void mdkr_memory_shutdown(void) {
+ }
+ #endif
+ 
++#ifdef NATIVE_PORT
++/* dkr360: how far into the arena the main pool's live blocks reach, in bytes from its start (0: not known). The
++ * pool's allocator is best-fit, so its free tail stays the last block taken and the live ones gather low; the
++ * presentation replay's arena copy (gfx_retained_task.c) needs only this much on the Xbox 360, where copying all 16 MB
++ * every authored frame costs some 9 ms. */
++size_t mdkr_mempool_main_used_bytes(void) {
++    const MemoryPool *pool;
++    const u8 *base;
++    uintptr_t highest = 0;
++    s32 i;
++
++    if (gNumberOfMemoryPools < 0 || gMemoryPools[0].slots == NULL) {
++        return 0;
++    }
++    pool = &gMemoryPools[0];
++    base = (const u8 *) pool->slots;
++    /* The blocks in use, along the pool's list as mempool_slot_find walks it (entries past curNumSlots are not
++     * blocks); a list longer than the slots is a broken one: not known. */
++    i = 0;
++    for (s32 walked = 0; i != MEMSLOT_NONE; walked++) {
++        const MemoryPoolSlot *slot;
++        if (walked > pool->maxNumSlots || i < 0 || i >= pool->maxNumSlots) {
++            return 0;
++        }
++        slot = &pool->slots[i];
++        if (slot->flags != SLOT_FREE && slot->data != NULL && slot->size > 0) {
++            const uintptr_t end = (uintptr_t) (slot->data + slot->size) - (uintptr_t) base;
++            if (end > highest) {
++                highest = end;
++            }
++        }
++        i = slot->nextIndex;
++    }
++    return (size_t) highest;
++}
++#endif
++
+ /**
+  * Creates the main memory pool.
+  * Starts at 0x8012D3F0. Ends at 0x80400000. Contains 1600 allocation slots.
+diff --git a/game/src/menu.c b/game/src/menu.c
+index ea9b54b8..1737428d 100644
+--- a/game/src/menu.c
++++ b/game/src/menu.c
+@@ -3988,6 +3988,14 @@ void init_save_data(void) {
+     }
+ 
+     gCheatsAssetData = (u16(*)[30]) get_misc_asset(ASSET_MISC_MAGIC_CODES);
++#ifdef NATIVE_PORT
++    {
++        extern u16 *gMdkrMagicCodesV77; /* objects.c: a 1.0 cartridge's table in 1.1's layout */
++        if (gMdkrMagicCodesV77 != NULL) {
++            gCheatsAssetData = (u16(*)[30]) gMdkrMagicCodesV77;
++        }
++    }
++#endif
+     gNumberOfCheats = (*gCheatsAssetData)[0];
+ #if VERSION >= VERSION_79
+     gMenuText = mempool_alloc_safe(1280 * sizeof(char *), COLOUR_TAG_WHITE);
+diff --git a/game/src/objects.c b/game/src/objects.c
+index 39df41fb..5a3dcdb6 100644
+--- a/game/src/objects.c
++++ b/game/src/objects.c
+@@ -503,6 +503,10 @@ static void bonus_visual_trace_transform_bypass(const Object *obj) {
+ #include <stdio.h>  /* fprintf — loud corruption asserts below */
+ #include <stdlib.h> /* abort */
+ #include <string.h> /* strchr — native trace/test-hook parsing */
++#ifdef NATIVE_PORT
++/* dkr360: a 1.0 cartridge's magic-code table rebuilt in 1.1's layout (below, after decrypt_magic_codes), or NULL */
++u16 *gMdkrMagicCodesV77 = NULL;
++#endif
+ 
+ void mdkr_objcoll_hit(void);   /* platform/hasm_stubs_temp.c — [OBJCOLL] telemetry */
+ int  mdkr_objcoll_legacy(void); /*   ""      — MDKR_OBJCOLL=legacy A/B arm */
+@@ -2194,11 +2198,49 @@ void allocate_object_pools(void) {
+      * transposes bit pairs across each four-byte group, so byte-swapping before
+      * decrypting is NOT equivalent and corrupts the plaintext. Decrypt first,
+      * then swap only the plaintext index block; the ASCII strings stay bytes. */
++    gMdkrMagicCodesV77 = NULL;
+     if (!asset_swap_misc_magic_codes(
+             &gAssetsMiscSection[gAssetsMiscTable[ASSET_MISC_MAGIC_CODES]],
+             (u32) get_misc_asset_size(ASSET_MISC_MAGIC_CODES))) {
+-        fprintf(stderr, "[FATAL] decrypted magic-code table failed structural validation\n");
+-        abort();
++        /* dkr360: US/EU 1.0 (v77) keep two strings a code (the code, its name) where 1.1 keeps three (the code, its
++         * name, the Japanese name); this build's menu.c is 1.1's. Such a table is rebuilt in 1.1's layout, its name
++         * standing in for the third string, the index block in host order. The blob is still in ROM order here
++         * (asset_swap_misc_magic_codes put back what it swapped). */
++        const u8 *raw = (const u8 *) &gAssetsMiscSection[gAssetsMiscTable[ASSET_MISC_MAGIC_CODES]];
++        const u32 rawSize = (u32) get_misc_asset_size(ASSET_MISC_MAGIC_CODES);
++        const u32 count = rawSize >= 4 ? ((u32) raw[0] << 8) | raw[1] : 0;
++        const u32 oldIndexBytes = (1u + count * 2u) * 2u;
++        const u32 first = rawSize >= 4 ? ((u32) raw[2] << 8) | raw[3] : 0;
++        if (count != 0 && count <= 32 && first == oldIndexBytes && oldIndexBytes < rawSize) {
++            const u32 grow = count * 2u;
++            u16 *table = (u16 *) mempool_alloc_safe((s32) (rawSize + grow + 4), COLOUR_TAG_WHITE);
++            u32 c;
++            bool ok = TRUE;
++            table[0] = (u16) count;
++            for (c = 0; c < count; c++) {
++                const u32 code = ((u32) raw[2 + c * 4] << 8) | raw[3 + c * 4];
++                const u32 name = ((u32) raw[4 + c * 4] << 8) | raw[5 + c * 4];
++                if (code < oldIndexBytes || code >= rawSize || name < oldIndexBytes || name >= rawSize) {
++                    ok = FALSE;
++                    break;
++                }
++                table[1 + c * 3] = (u16) (code + grow);
++                table[2 + c * 3] = (u16) (name + grow);
++                table[3 + c * 3] = (u16) (name + grow);
++            }
++            if (ok) {
++                memcpy((u8 *) table + oldIndexBytes + grow, raw + oldIndexBytes, rawSize - oldIndexBytes);
++                ((u8 *) table)[rawSize + grow] = '\0';
++                gMdkrMagicCodesV77 = table;
++                fprintf(stderr, "[ROM] magic codes: %u in 1.0's layout, rebuilt in 1.1's\n", (unsigned) count);
++            }
++        }
++        if (gMdkrMagicCodesV77 == NULL) {
++            fprintf(stderr, "[FATAL] decrypted magic-code table failed structural validation "
++                            "(size %d, bytes %02X %02X %02X %02X)\n",
++                    (int) rawSize, raw[0], raw[1], raw[2], raw[3]);
++            abort();
++        }
+     }
+ #endif
+     gObjPtrList = mempool_alloc_safe(sizeof(uintptr_t) * OBJECT_SLOT_COUNT, COLOUR_TAG_BLUE);
+@@ -2697,6 +2739,9 @@ static s32 mdkr_objmap_probe_enabled(void) {
+  * struct may simply not be present in this level's record, and swapping past the
+  * stride would corrupt the *next* entry. Never widen it. */
+ static void mdkr_objmap_swap_u16(s32 behaviorId, u8 *e, s32 off, s32 stride) {
++#ifdef MDKR_HOST_BIG_ENDIAN /* dkr360: the ROM's order is the host's on a big-endian host */
++    return;
++#endif
+     if (off + 2 <= stride) {
+         u8 t = e[off];
+         u16 before;
+@@ -15235,11 +15280,13 @@ void dkr_misc_swap_words(s32 index) {
+         return;
+     }
+     base = (u32 *) gAssetsMiscSection;
++#ifndef MDKR_HOST_BIG_ENDIAN /* dkr360: the ROM's order is the host's on a big-endian host */
+     for (w = wstart; w < wend; w++) {
+         u32 v = base[w];
+         base[w] = ((v & 0x000000FFu) << 24) | ((v & 0x0000FF00u) << 8) | ((v & 0x00FF0000u) >> 8) |
+                   ((v & 0xFF000000u) >> 24);
+     }
++#endif
+ }
+ 
+ /*
+@@ -15258,10 +15305,12 @@ void dkr_misc_swap_halfwords(s32 index) {
+         return;
+     }
+     base = (u16 *) gAssetsMiscSection;
++#ifndef MDKR_HOST_BIG_ENDIAN /* dkr360: the ROM's order is the host's on a big-endian host */
+     for (h = wstart * 2; h < wend * 2; h++) { /* s32-word range -> halfword range */
+         u16 v = base[h];
+         base[h] = (u16) ((v << 8) | (v >> 8));
+     }
++#endif
+ }
+ 
+ /*
+@@ -15365,6 +15414,7 @@ static void dkr_misc_swap_shield_records(void) {
+                 (int) n, (int) DKR_SHIELD_ENTRIES, (int) NUMBER_OF_PLAYER_VEHICLES, (int) NUMBER_OF_CHARACTERS);
+         abort();
+     }
++#ifndef MDKR_HOST_BIG_ENDIAN /* dkr360: the ROM's order is the host's on a big-endian host */
+     for (i = 0; i < n; i++) {
+         u8 *rec = base + (i * DKR_SHIELD_ROM_STRIDE);
+         s32 k;
+@@ -15380,6 +15430,7 @@ static void dkr_misc_swap_shield_records(void) {
+                  ((v & 0xFF000000u) >> 24);
+         }
+     }
++#endif
+ }
+ 
+ /*
+diff --git a/game/src/tracks.c b/game/src/tracks.c
+index d4b7189e..5a7f88d3 100644
+--- a/game/src/tracks.c
++++ b/game/src/tracks.c
+@@ -6102,11 +6102,13 @@ void generate_track(s32 modelId) {
+     {
+         s32 bspNodeCount = gCurrentLevelModel->numberOfSegments - 1;
+         BspTreeNode *bsp = DKR_PTR(BspTreeNode, gCurrentLevelModel->segmentsBspTree);
++#ifndef MDKR_HOST_BIG_ENDIAN /* dkr360: the ROM's order is the host's on a big-endian host */
+         for (k = 0; k < bspNodeCount; k++) {
+             bsp[k].leftNode   = (s16) (((u16) bsp[k].leftNode   << 8) | ((u16) bsp[k].leftNode   >> 8));
+             bsp[k].rightNode  = (s16) (((u16) bsp[k].rightNode  << 8) | ((u16) bsp[k].rightNode  >> 8));
+             bsp[k].splitValue = (s16) (((u16) bsp[k].splitValue << 8) | ((u16) bsp[k].splitValue >> 8));
+         }
++#endif
+     }
+ #endif
+ 
+diff --git a/platform/audi_port_dkr.c b/platform/audi_port_dkr.c
+index ff77a0d0..1cec94ce 100644
+--- a/platform/audi_port_dkr.c
++++ b/platform/audi_port_dkr.c
+@@ -270,6 +270,50 @@ static void SDLCALL dkr_audio_device_callback(void *userdata, Uint8 *stream,
+         return;
+     }
+     mdkr_audio_ring_pull(ring, (s16 *)stream, frames);
++#ifdef __XSDK__
++    /* dkr360: the loudest sample since the last heartbeat (platform/xbox360/src/xsdk_glue.c logs it), so a run
++     * nobody listens to (Xenia) shows whether sound came out. */
++    {
++        extern volatile int gDkr360AudioPeak;
++        extern long xsdk_thread_move(unsigned hardware_thread);
++        static int moved;
++        if (!moved) {
++            moved = 1;
++            (void)xsdk_thread_move(4); /* the audio thread off the game's hardware thread (2) */
++        }
++        const s16 *s = (const s16 *)stream;
++        int peak = gDkr360AudioPeak;
++        for (u32 i = 0; i < frames * (u32)DKR_AUDIO_CHANNELS; i++) {
++            const int v = s[i] < 0 ? -(int)s[i] : (int)s[i];
++            if (v > peak) {
++                peak = v;
++            }
++        }
++        gDkr360AudioPeak = peak;
++        /* With a game:\dkr360_audio_dump.txt, the first 8 MB played, as played, to check it on a PC. */
++        {
++            static FILE *dump;
++            static size_t dumped;
++            static int opened;
++            if (!opened) {
++                FILE *flag = fopen("dkr360_audio_dump.txt", "r");
++                opened = 1;
++                if (flag != NULL) {
++                    fclose(flag);
++                    dump = fopen("dkr360_audio.raw", "wb");
++                }
++            }
++            if (dump != NULL) {
++                fwrite(stream, 1, (size_t)len, dump);
++                dumped += (size_t)len;
++                if (dumped >= (8u << 20)) {
++                    fclose(dump);
++                    dump = NULL;
++                }
++            }
++        }
++    }
++#endif
+ }
+ 
+ /* ---- pump rate controller ------------------------------------------------ */
+diff --git a/platform/fast3d/gfx_pc_dkr.c b/platform/fast3d/gfx_pc_dkr.c
+index 7c42adea..60d2f4fb 100644
+--- a/platform/fast3d/gfx_pc_dkr.c
++++ b/platform/fast3d/gfx_pc_dkr.c
+@@ -96,6 +96,9 @@
+ #include "mod_texture_store.h"
+ #include "gfx_texpack_upload_budget.h"  /* replacement uploads per walk */
+ #include "host_sched_probe.h"  /* frame-wait rows: was the thread off-core? */
++#ifdef __XSDK__
++#include "video_config.h"      /* dkr360: Video.Aspect, for black 4:3 bars */
++#endif
+ #include "rice_crc.h"   /* Rice/GLideN64 texture identity */
+ #include "gfx_uniforms.h"
+ #include "gfx_pc_dkr.h"
+@@ -1731,6 +1734,23 @@ static inline void *dkr_resolve(uint32_t addr) {
+         }
+     }
+ 
++#ifdef __XSDK__
++    /* dkr360: the Xbox 360's map isn't the browser's. The title's image (globals, rodata) is at 0x82000000 up, so a
++     * global's K0 token, p - 0x80000000, is 0x02xxxxxx, inside the segment range, and its raw pointer has bit 31
++     * set; malloc's heap starts near 0 (the arena is still forced to 0x10000000). The image is decided before the
++     * arena: during a presentation replay g_dkrArenaBase is the retained copy, itself in the heap, where a global's
++     * K0 token can land (the replay then walked zeros to the copy's end). */
++    {
++        extern char xsdk_jit_end[];
++        const uintptr_t imageStart = 0x82000000u, imageEnd = (uintptr_t)xsdk_jit_end;
++        if (flip >= imageStart && flip < imageEnd) {
++            return dkr_retain_resolved_pointer((void *)(uintptr_t)flip);
++        }
++        if (addr >= imageStart && addr < imageEnd) {
++            return dkr_retain_resolved_pointer((void *)(uintptr_t)addr);
++        }
++    }
++#endif
+     uintptr_t base = (uintptr_t) g_dkrArenaBase;
+     uintptr_t end  = base + (uintptr_t) g_dkrArenaSize;
+     uint32_t cand[2] = { flip, addr };
+@@ -4378,6 +4398,10 @@ static void dkr_emit_tri(const struct LoadedVertex *v0,
+     software_far_clamp =
+         mdkr_render_backend() == MDKR_BACKEND_WEBGPU &&
+         !gfx_webgpu_unclipped_depth_supported();
++#endif
++#ifdef __XSDK__
++    /* dkr360: Xenos clips at z = w too and has no depth clamp */
++    software_far_clamp = true;
+ #endif
+     if (buf_vbo_num_tris + 1 > DKR_MAX_BUFFERED) gfx_flush();
+ 
+@@ -5874,7 +5898,16 @@ static void dkr_dp_fill_rectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_t
+      * that covers the complete logical framebuffer; full-screen menu panels
+      * drawn after SAFE_2D tagging remain undistorted in the safe area.
+      */
+-    if (saved_space == G_MTX_DKR_SPACE_WORLD &&
++#ifdef __XSDK__
++    /* dkr360: with the picture forced to 4:3 the gutters stay black (the Xenos backend clears the whole screen to
++     * black at every frame's start, replays included), as bars, not in the track's clear colour. */
++    const bool dkr360_black_bars =
++        mdkr_video_config_current() != NULL &&
++        strcmp(mdkr_video_config_current()->values[MDKR_VIDEO_ASPECT].text, "4:3") == 0;
++#else
++    const bool dkr360_black_bars = false;
++#endif
++    if (!dkr360_black_bars && saved_space == G_MTX_DKR_SPACE_WORLD &&
+         (cyc == G_CYC_FILL || cyc == G_CYC_COPY) &&
+         ulx <= 0 && uly <= 0 &&
+         lrx >= DESIRED_SCREEN_WIDTH * 4 &&
+@@ -6017,12 +6050,13 @@ static void dkr_dl_fault(const char *reason, const Gfx *cmd, int depth) {
+     const bool readable = dkr_dl_command_aligned(cmd) &&
+                           dkr_room_for(cmd, sizeof(Gfx));
+     fprintf(stderr,
+-            "[DL] %s at depth=%d cmd=%p words=%08x/%08x%s%s\n",
++            "[DL] %s at depth=%d cmd=%p words=%08x/%08x%s%s replay=%d orig=%p\n",
+             reason, depth, (const void *) cmd,
+             readable ? cmd->words.w0 : 0,
+             readable ? cmd->words.w1 : 0,
+             readable ? "" : " (unreadable or unaligned)",
+-            strict ? " (strict: aborting)" : " (recovered: list stopped/skipped)");
++            strict ? " (strict: aborting)" : " (recovered: list stopped/skipped)",
++            (int) dkr_replay_pass, gfx_retained_task_original_address(cmd));
+     fflush(stderr);
+     if (strict) {
+         abort();
+diff --git a/platform/fast3d/gfx_retained_task.c b/platform/fast3d/gfx_retained_task.c
+index 17cf8b9a..8b810510 100644
+--- a/platform/fast3d/gfx_retained_task.c
++++ b/platform/fast3d/gfx_retained_task.c
+@@ -301,7 +301,31 @@ bool gfx_retained_task_capture_commit(
+         return false;
+     }
+     next.arena = capture_arena;
++#ifdef __XSDK__
++    {
++        /* dkr360: only as far as the main pool's live blocks reach (game/src/memory.c); past them the copy holds
++         * free memory either way. All 16 MB is some 9 ms an authored frame on the Xbox 360. */
++        extern size_t mdkr_mempool_main_used_bytes(void);
++        extern void xsdk_log_write(const char *format, ...);
++        static uint64_t s_copies, s_copied_bytes;
++        size_t used = mdkr_mempool_main_used_bytes();
++        if (used == 0u || used > s_capture.arena_size - 4096u) {
++            used = s_capture.arena_size;
++        } else {
++            used = (used + 4095u) & ~(size_t)4095u;
++        }
++        memcpy(next.arena, s_capture.arena, used);
++        s_copied_bytes += used;
++        if (++s_copies % 1800u == 0u) {
++            xsdk_log_write("dkr360: replay copies of the arena %u KB on average (of %u KB)",
++                           (unsigned)(s_copied_bytes / 1800u / 1024u),
++                           (unsigned)(s_capture.arena_size / 1024u));
++            s_copied_bytes = 0;
++        }
++    }
++#else
+     memcpy(next.arena, s_capture.arena, s_capture.arena_size);
++#endif
+     next.original_arena = s_capture.arena;
+     next.arena_size = s_capture.arena_size;
+     next.authored_tick = s_capture.authored_tick;
+diff --git a/platform/host_sched_probe.c b/platform/host_sched_probe.c
+index ecc8a0c5..fa9342ee 100644
+--- a/platform/host_sched_probe.c
++++ b/platform/host_sched_probe.c
+@@ -66,7 +66,7 @@ void mdkr_host_sched_sample(MdkrHostSchedSample *out) {
+     }
+ }
+ 
+-#elif !defined(_WIN32) && !defined(__EMSCRIPTEN__)
++#elif !defined(_WIN32) && !defined(__EMSCRIPTEN__) && !defined(__XSDK__)
+ #include <sys/resource.h>
+ 
+ void mdkr_host_sched_sample(MdkrHostSchedSample *out) {
+diff --git a/platform/main_pc.c b/platform/main_pc.c
+index 01c71cdf..9e9d9a96 100644
+--- a/platform/main_pc.c
++++ b/platform/main_pc.c
+@@ -18,7 +18,7 @@
+ #endif
+ #ifndef __EMSCRIPTEN__
+ #include <signal.h>
+-#ifndef _WIN32
++#if !defined(_WIN32) && !defined(__XSDK__)
+ #include <execinfo.h>       /* backtrace() — glibc/macOS only; absent on wasm AND Windows */
+ #endif
+ #endif
+@@ -130,6 +130,10 @@ static void mdkr_crash_handler(int sig) {
+         n = snprintf(line, sizeof(line), "  #%u %p\n", (unsigned) i, bt[i]);
+         if (n > 0) mdkr_crash_write(line, (unsigned) n);
+     }
++#elif defined(__XSDK__)
++    /* dkr360: no backtrace on the Xbox 360; Xenia's crash dump names the PC */
++    (void)bt;
++    fprintf(stderr, "\n[CRASH] signal %d\n", sig);
+ #else
+     int n = backtrace(bt, 40);
+     fprintf(stderr, "\n[CRASH] signal %d - backtrace (%d frames):\n", sig, n);
+@@ -160,7 +164,9 @@ extern void camera_obstruction_runtime_install_config_apply(void);
+  * (platform/fast3d/gfx_opengl.c). Forward-declared opaquely to avoid pulling the
+  * full fast3d/PR headers into the entry point. */
+ struct GfxRenderingAPI;
+-#ifndef __EMSCRIPTEN__
++#if defined(__XSDK__)
++extern struct GfxRenderingAPI gfx_xenos_api;    /* dkr360: the Xbox 360's Xenos backend */
++#elif !defined(__EMSCRIPTEN__)
+ extern struct GfxRenderingAPI gfx_opengl_api;   /* GL backend — desktop only */
+ #endif
+ #ifdef MDKR_WEBGPU_BACKEND
+@@ -220,7 +226,8 @@ static void print_usage(const char *program) {
+  * pre-shell binary. Without MDKR_APP (the wasm build, and -DMDKR_APP=OFF) this
+  * is still main() and nothing about the engine's startup differs.
+  */
+-#ifdef MDKR_APP
++#if defined(MDKR_APP) || defined(__XSDK__)
++/* dkr360: on the Xbox 360, platform/xbox360/src/dkr360_main.c owns main() and runs this on a thread of its own */
+ int mdkr64_headless_main(int argc, char **argv);
+ int mdkr64_headless_main(int argc, char **argv) {
+ #else
+@@ -481,6 +488,8 @@ int main(int argc, char **argv) {
+ #ifdef __EMSCRIPTEN__
+     /* Web is WebGPU-only (no GL backend compiled in the wasm binary). */
+     struct GfxRenderingAPI *rapi = &gfx_webgpu_api;
++#elif defined(__XSDK__)
++    struct GfxRenderingAPI *rapi = &gfx_xenos_api; /* dkr360: platform/xbox360/src/gfx_xenos.cpp */
+ #else
+     struct GfxRenderingAPI *rapi = &gfx_opengl_api;
+ #ifdef MDKR_WEBGPU_BACKEND
+diff --git a/platform/online/compatibility_identity.c b/platform/online/compatibility_identity.c
+index 3749180c..28b416d9 100644
+--- a/platform/online/compatibility_identity.c
++++ b/platform/online/compatibility_identity.c
+@@ -24,6 +24,8 @@
+ #define MDKR_ONLINE_OS_TAG "windows"
+ #elif defined(__linux__)
+ #define MDKR_ONLINE_OS_TAG "linux"
++#elif defined(__XSDK__) /* dkr360: Xbox 360; online play is not built there */
++#define MDKR_ONLINE_OS_TAG "xbox360"
+ #else
+ #error "online OS tag unmapped for this platform: prove its gameplay \
+ determinism domain and add it here (and to the pinned unit vectors) before \
+diff --git a/platform/platform_sdl_min.c b/platform/platform_sdl_min.c
+index 952ac542..29bdeab3 100644
+--- a/platform/platform_sdl_min.c
++++ b/platform/platform_sdl_min.c
+@@ -47,7 +47,11 @@
+ #endif
+ #include <windows.h>
+ #endif
++#ifdef __XSDK__
++#include "dkr360_gl_compat.h"   /* dkr360: Xenos draws; no GL on the Xbox 360 */
++#else
+ #include <glad/glad.h>          /* GL loader — desktop only; web is WebGPU-only */
++#endif
+ #include <SDL_syswm.h>
+ #else
+ #include <emscripten/emscripten.h>
+@@ -1046,8 +1050,8 @@ static int sdl_should_start_fullscreen(void) {
+ }
+ 
+ int platform_sdl_surface_presentable(void) {
+-#ifdef __EMSCRIPTEN__
+-    return 1;
++#if defined(__EMSCRIPTEN__) || defined(__XSDK__)
++    return 1; /* dkr360: the Xbox 360's display is always there */
+ #else
+     if (s_window == NULL) {
+         return 0;
+@@ -1105,8 +1109,14 @@ int platform_sdl_init(void) {
+                 "an automatic fallback.\n");
+         return -1;
+     }
++#ifdef __XSDK__
++    /* dkr360: SDL-xenon has controllers and sound, no video */
++    if (SDL_WasInit(SDL_INIT_GAMECONTROLLER) == 0 &&
++        SDL_Init(SDL_INIT_GAMECONTROLLER | SDL_INIT_EVENTS) != 0) {
++#else
+     if (SDL_WasInit(SDL_INIT_VIDEO) == 0 &&
+         SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) != 0) {
++#endif
+         fprintf(stderr, "[SDL] init failed: %s\n", SDL_GetError());
+         return -1;
+     }
+@@ -1175,6 +1185,23 @@ int platform_sdl_init(void) {
+     }
+ #endif
+ 
++#ifdef __XSDK__
++    /* dkr360: no window on the Xbox 360; gfx_xenos.cpp owns the display. The present path below is the GL one
++     * (s_glReady), with Xenos behind it. */
++    {
++        int width = 1280, height = 720;
++        if (dkr360_video_init(&width, &height) != 0) {
++            fprintf(stderr, "[SDL] Xenos video init failed\n");
++            return -1;
++        }
++        s_initialWindowWidth = width;
++        s_initialWindowHeight = height;
++        s_glReady = 1;
++        printf("[SDL] Xenos display %dx%d\n", width, height);
++        return 0;
++    }
++#endif
++
+     Uint32 base_flags = SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_RESIZABLE;
+     /* A visible automation window is still born hidden. SDL shows a
+      * non-hidden window with makeKeyAndOrderFront, and that activates an
+@@ -3000,6 +3027,65 @@ static void gc_read(
+     if (sy < -8 || sy > 8) p->stick_y = sy;
+ }
+ 
++#ifdef __XSDK__
++/* dkr360: the Xbox 360's controllers straight from XAM, for a port SDL has no controller on (SDL-xenon reads them
++ * through XAM too; this keeps the game playable if it ever doesn't). The same normalized bindings as gc_read. */
++typedef struct Dkr360XamState {
++    uint32_t packet_number;
++    uint16_t buttons;
++    uint8_t left_trigger, right_trigger;
++    int16_t thumb_lx, thumb_ly, thumb_rx, thumb_ry;
++} Dkr360XamState;
++extern uint32_t XamInputGetState(uint32_t user_index, uint32_t flags, void *state);
++
++static int dkr360_xam_state(int port, Dkr360XamState *st) {
++    memset(st, 0, sizeof(*st));
++    return XamInputGetState((uint32_t)port, 0, st) == 0;
++}
++
++static int dkr360_xam_axis(int v) {
++    /* XInput's own dead zone (7849 of 32767), then the N64's +/-80 */
++    const int dead = 7849;
++    int out;
++    if (v > -dead && v < dead) return 0;
++    out = v > 0 ? (v - dead) * STICK_FULL / (32767 - dead) : (v + dead) * STICK_FULL / (32768 - dead);
++    if (out < -STICK_FULL) out = -STICK_FULL;
++    if (out > STICK_FULL) out = STICK_FULL;
++    return out;
++}
++
++static void dkr360_xam_read(int port, struct pad_state *p) {
++    Dkr360XamState st;
++    MdkrControllerDigitalState normalized = {{0}};
++    if (!dkr360_xam_state(port, &st)) {
++        return;
++    }
++    normalized.active[MDKR_CONTROLLER_SOURCE_A] = (st.buttons & 0x1000) != 0;
++    normalized.active[MDKR_CONTROLLER_SOURCE_B] = (st.buttons & 0x2000) != 0;
++    normalized.active[MDKR_CONTROLLER_SOURCE_X] = (st.buttons & 0x4000) != 0;
++    normalized.active[MDKR_CONTROLLER_SOURCE_Y] = (st.buttons & 0x8000) != 0;
++    normalized.active[MDKR_CONTROLLER_SOURCE_START] = (st.buttons & 0x0010) != 0;
++    normalized.active[MDKR_CONTROLLER_SOURCE_LEFT_STICK] = (st.buttons & 0x0040) != 0;
++    normalized.active[MDKR_CONTROLLER_SOURCE_RIGHT_STICK] = (st.buttons & 0x0080) != 0;
++    normalized.active[MDKR_CONTROLLER_SOURCE_LEFT_SHOULDER] = (st.buttons & 0x0100) != 0;
++    normalized.active[MDKR_CONTROLLER_SOURCE_RIGHT_SHOULDER] = (st.buttons & 0x0200) != 0;
++    normalized.active[MDKR_CONTROLLER_SOURCE_DPAD_UP] = (st.buttons & 0x0001) != 0;
++    normalized.active[MDKR_CONTROLLER_SOURCE_DPAD_DOWN] = (st.buttons & 0x0002) != 0;
++    normalized.active[MDKR_CONTROLLER_SOURCE_DPAD_LEFT] = (st.buttons & 0x0004) != 0;
++    normalized.active[MDKR_CONTROLLER_SOURCE_DPAD_RIGHT] = (st.buttons & 0x0008) != 0;
++    normalized.active[MDKR_CONTROLLER_SOURCE_LEFT_TRIGGER] = st.left_trigger > 30;
++    normalized.active[MDKR_CONTROLLER_SOURCE_RIGHT_TRIGGER] = st.right_trigger > 30;
++    /* XInput's right stick: +y is up */
++    normalized.active[MDKR_CONTROLLER_SOURCE_RIGHT_STICK_LEFT] = st.thumb_rx < -12000;
++    normalized.active[MDKR_CONTROLLER_SOURCE_RIGHT_STICK_RIGHT] = st.thumb_rx > 12000;
++    normalized.active[MDKR_CONTROLLER_SOURCE_RIGHT_STICK_UP] = st.thumb_ry > 12000;
++    normalized.active[MDKR_CONTROLLER_SOURCE_RIGHT_STICK_DOWN] = st.thumb_ry < -12000;
++    p->buttons |= mdkr_controller_mapped_buttons(mdkr_video_config_current(), &normalized);
++    p->stick_x = dkr360_xam_axis(st.thumb_lx);
++    p->stick_y = dkr360_xam_axis(st.thumb_ly);
++}
++#endif
++
+ /* Read the keyboard (P1 only) into N64 button bits + stick. */
+ static void kbd_read(struct pad_state *p) {
+     const Uint8 *k = s_keyboardDown;
+@@ -3382,6 +3468,10 @@ static void input_capture_live(uint64_t target_tick) {
+         MdkrInputSample source = {0, 0, 0, false};
+         MdkrInputSample sample = {0, 0, 0, false};
+         MdkrPadSourceKind kind = MDKR_PAD_NONE;
++#ifdef __XSDK__
++        int dkr360Xam = 0;
++        Dkr360XamState dkr360XamProbe;
++#endif
+ 
+         /* Explicit one-source policy: physical controller, then selected local
+          * touch, then the P1 keyboard fallback. This removes the old bitwise
+@@ -3389,6 +3479,13 @@ static void input_capture_live(uint64_t target_tick) {
+         if (s_gc[port] != NULL) {
+             kind = MDKR_PAD_SDL;
+             live.present = 1;
++#ifdef __XSDK__
++        } else if (dkr360_xam_state(port, &dkr360XamProbe)) {
++            /* dkr360: a controller XAM has and SDL hasn't opened */
++            kind = MDKR_PAD_SDL;
++            live.present = 1;
++            dkr360Xam = 1;
++#endif
+ #ifdef __EMSCRIPTEN__
+         } else if (port == 0 && s_browserTouchSource.present) {
+             kind = MDKR_PAD_LOCAL_TOUCH;
+@@ -3398,11 +3495,22 @@ static void input_capture_live(uint64_t target_tick) {
+             kind = MDKR_PAD_KEYBOARD;
+             live.present = 1;
+         }
++#ifdef __XSDK__
++        /* dkr360: the console menu (platform/xbox360/src/dkr360_menu.cpp) keeps the pads while it is open */
++        extern int dkr360_menu_wants_input(void);
++        if (!s_gameInputSuppressed && !dkr360_menu_wants_input()) {
++#else
+         if (!s_gameInputSuppressed) {
++#endif
+             if (kind == MDKR_PAD_KEYBOARD) {
+                 kbd_read(&live);
+             }
+             if (kind == MDKR_PAD_SDL) {
++#ifdef __XSDK__
++                if (dkr360Xam) {
++                    dkr360_xam_read(port, &live);
++                } else
++#endif
+                 gc_read(&s_controllerSource[port], &live);
+                 /* One source at a time, but presence must not outrank use: a
+                  * merely-connected pad (charging, paired, idle, or slightly
+@@ -4147,7 +4255,11 @@ void platform_sdl_present(void) {
+         sdl_gl_resource_heartbeat("before-swap", 0);
+         {
+             const uint64_t wait_start = gfx_dkr_wait_begin();
++#ifdef __XSDK__
++            dkr360_video_present();
++#else
+             SDL_GL_SwapWindow(s_window);
++#endif
+             gfx_dkr_wait_end(GFX_DKR_WAIT_SWAP, wait_start);
+         }
+         g_surfaceFrameCounter++;

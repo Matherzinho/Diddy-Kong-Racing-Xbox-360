@@ -1,0 +1,44 @@
+diff --git a/src/dynapi/SDL_dynapi.h b/src/dynapi/SDL_dynapi.h
+index 721488c..7fabde0 100644
+--- a/src/dynapi/SDL_dynapi.h
++++ b/src/dynapi/SDL_dynapi.h
+@@ -65,6 +65,8 @@
+ #define SDL_DYNAMIC_API 0 /* vitasdk doesn't support dynamic linking */
+ #elif defined(SDL_PLATFORM_NGAGE)
+ #define SDL_DYNAMIC_API 0 /* The N-Gage doesn't support dynamic linking either */
++#elif defined(__XSDK__)
++#define SDL_DYNAMIC_API 0 /* Xbox 360 homebrew (xsdk): static only */
+ #elif defined(SDL_PLATFORM_3DS)
+ #define SDL_DYNAMIC_API 0 /* devkitARM doesn't support dynamic linking */
+ #elif defined(DYNAPI_NEEDS_DLOPEN) && !defined(HAVE_DLOPEN)
+diff --git a/src/sdl2_compat.c b/src/sdl2_compat.c
+index a19fe0d..277e906 100644
+--- a/src/sdl2_compat.c
++++ b/src/sdl2_compat.c
+@@ -393,6 +393,26 @@ static char loaderror[256];
+     #define LoadSDL3Library() ((Loaded_SDL3 = LoadLibraryA(SDL3_LIBNAME)) != NULL)
+     #define LookupSDL3Sym(sym) (void *)GetProcAddress(Loaded_SDL3, sym)
+     #define CloseSDL3Library() { if (Loaded_SDL3) { FreeLibrary(Loaded_SDL3); Loaded_SDL3 = NULL; } }
++#elif defined(__XSDK__)
++    /* Xbox 360 (xsdk): no dynamic loader. SDL3 is linked statically into the same executable with every
++       global SDL_* symbol renamed to SDL3X_* (objcopy --redefine-syms, see oot360 deps/build-sdl.sh),
++       so SDL2's and SDL3's names don't collide, and symbols are looked up in this static table. */
++    #define DIRSEP "/"
++    static int Loaded_SDL3 = 0;
++    #define SDL3_SYM(rc,fn,params,args,ret) extern void SDL3X_##fn(void);
++    #include "sdl3_syms.h"
++    static int SDL3X_streq(const char *a, const char *b) {
++        while (*a && *a == *b) { a++; b++; }
++        return *a == *b;
++    }
++    static void *LookupSDL3Sym(const char *sym) {
++        /* sdl3_syms.h lines may end in ';', so each entry is a statement, not an initializer. */
++        #define SDL3_SYM(rc,fn,params,args,ret) if (SDL3X_streq("SDL_" #fn, sym)) { return (void *) SDL3X_##fn; }
++        #include "sdl3_syms.h"
++        return NULL;
++    }
++    #define LoadSDL3Library() ((Loaded_SDL3 = 1) != 0)
++    #define CloseSDL3Library() { Loaded_SDL3 = 0; }
+ #elif defined(__APPLE__)
+     #include <dlfcn.h>
+     #include <pwd.h>

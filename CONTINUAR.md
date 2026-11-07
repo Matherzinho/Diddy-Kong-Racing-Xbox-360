@@ -124,6 +124,24 @@ tamanho/LUT podem mudar se a tradução expandiu a ROM).
 
 Ganchos de teste novos: `dkr360_test_restart.txt` (reinicia no quadro 300).
 
+
+## Teste 3
+
+Logs do console (teste 2) leram: o jogo+render fica a ~95% de uma CPU nas cenas pesadas (walk ~300 ms/s, replay ~260,
+endframe ~130, audio ~85-100, game ~170); `missed` vblanks 100+/600 nas cenas pesadas; presente/buffers sem espera.
+O endframe era em boa parte a cópia da arena (agora medida: slot `copy`), audio ~4x mais lento que no Xenia.
+Mudanças (todas `__XSDK__`): `dkr360_emit_core` (gfx_pc_dkr.c): transformada de UV por triângulo (sem divisões por
+vértice), entradas de cor constantes lidas uma vez, escrita no VBO por ponteiro local (o contador global recarregava a
+cada float), sem contadores com divisão; caminho sem cópia de `LoadedVertex` para triângulos sem clipping, com sinal
+da área por determinante (sem 6 divisões); `-ffp-contract=fast` só no gfx_pc_dkr.c; menu não roda ImGui fechado.
+Xenia: poly 100-125 -> 55-80 ms/s, menu 10 -> 1. Ainda pendente: thread de audio (~10%), cópia da arena com
+dcbz (~12 ms/s), render thread (grande, ver nota do teste 2).
+
+Idioma: browse (preview) + A confirma + pergunta de reiniciar; B sem confirmar volta. ROM traduzida é "modificada":
+`dkr360_main.c` liga `MDKR_ROM_ALLOW_MODIFIED=1` só quando carrega dkr_pt/dkr_es. ROM es do usuário: Rev 1 +
+T-Spa carlosxpx2 1.0 (sha1 9655d78a...); parece traduzir só diálogos (sem OPCIONES/AVENTURA no binário).
+Gancho de teste: `dkr360_menu_open.txt` = "aba [idioma [1]]" (idioma 0-3, 1 = apertar A).
+
 ## Próximos passos sugeridos
 
 - Thread de render separada se o console ficar abaixo de 60.

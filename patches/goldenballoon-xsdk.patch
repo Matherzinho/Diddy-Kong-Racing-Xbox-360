@@ -312,7 +312,7 @@ index ff77a0d0..1cec94ce 100644
  
  /* ---- pump rate controller ------------------------------------------------ */
 diff --git a/platform/fast3d/gfx_pc_dkr.c b/platform/fast3d/gfx_pc_dkr.c
-index 7c42adea..01693eec 100644
+index 7c42adea..9019f874 100644
 --- a/platform/fast3d/gfx_pc_dkr.c
 +++ b/platform/fast3d/gfx_pc_dkr.c
 @@ -96,6 +96,16 @@
@@ -515,7 +515,15 @@ index 7c42adea..01693eec 100644
          buf_vbo_len = 0;
          buf_vbo_num_tris = 0;
      }
-@@ -4007,7 +4103,20 @@ static bool dkr_setup_draw_state(bool poly_tex_enabled) {
+@@ -3707,6 +3803,7 @@ static struct {
+     bool  use_fog;
+     uint8_t tile_base;
+     uint32_t tex_w[2], tex_h[2];
++    float inv_w[2], inv_h[2]; /* dkr360: 1 / size, set with the binds */
+     int   num_inputs;
+ } cur;
+ 
+@@ -4007,7 +4104,20 @@ static bool dkr_setup_draw_state(bool poly_tex_enabled) {
          use_fog, dkr_rdp_gradient_legacy_enabled());
  
      struct ColorCombiner *comb = dkr_lookup_or_create_combiner(cc_id, cc_options);
@@ -536,7 +544,7 @@ index 7c42adea..01693eec 100644
      cur.comb = comb;
      cur.num_inputs = cur.feat.num_inputs;
      cur.use_fog = cur.feat.opt_fog;
-@@ -4045,7 +4154,9 @@ static bool dkr_setup_draw_state(bool poly_tex_enabled) {
+@@ -4045,7 +4155,9 @@ static bool dkr_setup_draw_state(bool poly_tex_enabled) {
              uint8_t td = (uint8_t)(cur.tile_base + i);
              if (td >= 8) td = 0;
              uint32_t w = 1, h = 1;
@@ -546,7 +554,18 @@ index 7c42adea..01693eec 100644
              if (bind_ok[i]) {
                  cur.tex_w[i] = w; cur.tex_h[i] = h;
              } else {
-@@ -4361,6 +4472,24 @@ static void dkr_vbo_texcoord(const struct LoadedVertex *vtx, int ti, float *ou,
+@@ -4065,6 +4177,10 @@ static bool dkr_setup_draw_state(bool poly_tex_enabled) {
+             }
+         }
+     }
++    for (int i = 0; i < 2; i++) {
++        cur.inv_w[i] = 1.0f / (float)(cur.tex_w[i] ? cur.tex_w[i] : 1);
++        cur.inv_h[i] = 1.0f / (float)(cur.tex_h[i] ? cur.tex_h[i] : 1);
++    }
+     if (dkr_trace_this_frame) {
+         DTRACE("  setup: cc_id=%016llx opt=%03x shader_id0=%016llx numin=%d useTex=%d "
+                "usedTex[%d,%d] bindOK[%d,%d] texWH0=%ux%u tileBase=%d",
+@@ -4361,6 +4477,166 @@ static void dkr_vbo_texcoord(const struct LoadedVertex *vtx, int ti, float *ou,
   */
  static int dkr_dbg_emitted, dkr_dbg_onscreen;   /* per-frame draw telemetry */
  
@@ -568,10 +587,152 @@ index 7c42adea..01693eec 100644
 +#define DKR360_U8F(c) ((c) / 255.0f)
 +#endif
 +
++#ifdef __XSDK__
++/* dkr360: dkr_emit_tri for the Xbox 360's in-order CPU, same output (the packing the Xenos backend reads).
++ *  - the texture coordinates' transform (scale, shift, tile origin, half scale, filter offset, 1 / size) is worked out
++ *    once a triangle as a multiply and an add, not as divides a vertex (a float divide is some 30 cycles there);
++ *  - the colour inputs that don't change a vertex (primitive, environment, ...) are read once a triangle;
++ *  - the vertices go out through a local pointer: through buf_vbo_len, a global, every float store made the compiler
++ *    load and store the counter again (-fno-strict-aliasing), a load-hit-store each;
++ *  - no debug counters with divides. */
++static const float dkr360_pow2f[17] = { 1.f, 2.f, 4.f, 8.f, 16.f, 32.f, 64.f, 128.f, 256.f, 512.f, 1024.f, 2048.f,
++                                        4096.f, 8192.f, 16384.f, 32768.f, 65536.f };
++
++static void dkr360_emit_core(const struct LoadedVertex *const vs[3], const float uv[6]) {
++    if (buf_vbo_num_tris + 1 > DKR_MAX_BUFFERED) gfx_flush();
++    if ((rsp.geometry_mode & G_ZBUFFER) != 0 && (rdp.other_mode_l & Z_CMP) == Z_CMP) {
++        gfx_dkr_depth_compared_triangles++;
++        if ((rdp.other_mode_l & ZMODE_DEC) == ZMODE_DEC) {
++            gfx_dkr_decal_triangles++;
++        }
++    }
++    if (cur.feat.opt_dfdx_light) {
++        if (rsp.remaster_light_class == 1) {
++            gfx_dkr_remaster_racer_triangles++;
++        } else if (rsp.remaster_light_class == 2) {
++            gfx_dkr_remaster_character_triangles++;
++        }
++    }
++    dkr_dbg_emitted++;
++
++    const bool use_alpha = cur.feat.opt_alpha;
++    const int nk = use_alpha ? 2 : 1;
++
++    /* texture coordinates: out = in * A + B */
++    float uvx[2][4] = { { 0 } };
++    for (int ti = 0; ti < 2; ti++) {
++        if (!cur.feat.used_textures[ti]) continue;
++        const float ss = rsp.tex_scale_s ? ((float)rsp.tex_scale_s * (1.0f / 65536.0f)) : 1.0f;
++        const float st = rsp.tex_scale_t ? ((float)rsp.tex_scale_t * (1.0f / 65536.0f)) : 1.0f;
++        uint8_t td = (uint8_t)(cur.tile_base + ti);
++        if (td >= 8) td = 0;
++        const struct DkrTile *t = &rdp.tile[td];
++        float su = ss * (1.0f / 32.0f), sv = st * (1.0f / 32.0f);
++        if (t->shifts) su *= (t->shifts <= 10) ? (1.0f / dkr360_pow2f[t->shifts]) : dkr360_pow2f[16 - t->shifts];
++        if (t->shiftt) sv *= (t->shiftt <= 10) ? (1.0f / dkr360_pow2f[t->shiftt]) : dkr360_pow2f[16 - t->shiftt];
++        const float half = (!dkr_in_texrect && !(rdp.other_mode_h & G_TP_PERSP)) ? 0.5f : 1.0f;
++        const float filt = ((rdp.other_mode_h & (3U << G_MDSFT_TEXTFILT)) != G_TF_POINT) ? 0.5f : 0.0f;
++        uvx[ti][0] = su * half * cur.inv_w[ti];
++        uvx[ti][1] = (-((float)t->uls * 0.25f) * half + filt) * cur.inv_w[ti];
++        uvx[ti][2] = sv * half * cur.inv_h[ti];
++        uvx[ti][3] = (-((float)t->ult * 0.25f) * half + filt) * cur.inv_h[ti];
++    }
++
++    /* colour inputs: 0 the same for every vertex (cv), 1 the vertex's shade, 2 its shade alpha */
++    uint8_t mode[7][2];
++    float cv[7][2][4];
++    const int ninputs = cur.num_inputs < 7 ? cur.num_inputs : 7;
++    for (int j = 0; j < ninputs; j++) {
++        for (int k = 0; k < nk; k++) {
++            struct RGBA c = { 0, 0, 0, 0 };
++            mode[j][k] = 0;
++            switch (cur.comb->shader_input_mapping[k][j]) {
++                case G_CCMUX_PRIMITIVE:       c = rdp.prim_color; break;
++                case G_CCMUX_SHADE:           mode[j][k] = 1; break;
++                case G_CCMUX_ENVIRONMENT:     c = rdp.env_color; break;
++                case G_CCMUX_PRIMITIVE_ALPHA: c.r = c.g = c.b = c.a = rdp.prim_color.a; break;
++                case G_CCMUX_SHADE_ALPHA:     mode[j][k] = 2; break;
++                case G_CCMUX_ENV_ALPHA:       c.r = c.g = c.b = c.a = rdp.env_color.a; break;
++                case G_CCMUX_PRIM_LOD_FRAC:   c.r = c.g = c.b = c.a = rdp.prim_lod_fraction; break;
++                case G_CCMUX_LOD_FRACTION:    c.r = c.g = c.b = c.a = 255; break;
++                default: break;
++            }
++            cv[j][k][0] = DKR360_U8F(c.r);
++            cv[j][k][1] = DKR360_U8F(c.g);
++            cv[j][k][2] = DKR360_U8F(c.b);
++            cv[j][k][3] = DKR360_U8F(c.a);
++        }
++    }
++
++    const bool flip_x = rdp.view.viewport_flip_x;
++    const bool expanded = rdp.view.clip_expanded;
++    const float csx = rdp.view.clip_scale_x, csy = rdp.view.clip_scale_y;
++    const float cbx = rdp.view.clip_bias_x, cby = rdp.view.clip_bias_y;
++    const bool world_pos = cur.feat.opt_world_pos, light = cur.feat.opt_dfdx_light, fog = cur.use_fog;
++    const bool tex0 = cur.feat.used_textures[0], tex1 = cur.feat.used_textures[1];
++    const float fog_r = DKR360_U8F(rdp.fog_color.r), fog_g = DKR360_U8F(rdp.fog_color.g),
++                fog_b = DKR360_U8F(rdp.fog_color.b);
++
++    float *o = buf_vbo + buf_vbo_len;
++    for (int i = 0; i < 3; i++) {
++        const struct LoadedVertex *vt = vs[i];
++        float z = vt->z;
++        const float w = vt->w;
++        if (z > w) z = w;       /* Xenos clips at z = w and has no depth clamp */
++        z = (z + w) * 0.5f;     /* depth 0 to 1 */
++        float cx = flip_x ? -vt->x : vt->x;
++        float cy = vt->y;
++        if (expanded) {
++            cx = cx * csx + w * cbx;
++            cy = cy * csy + w * cby;
++        }
++        *o++ = cx; *o++ = cy; *o++ = z; *o++ = w;
++        if (world_pos) {
++            if (!vt->world_valid) gfx_dkr_shadow_receiver_invalid_world++;
++            *o++ = vt->world_x; *o++ = vt->world_y; *o++ = vt->world_z;
++        }
++        if (light) {
++            *o++ = vt->normal_x; *o++ = vt->normal_y; *o++ = vt->normal_z;
++            *o++ = vt->light_x;  *o++ = vt->light_y;  *o++ = vt->light_z;
++        }
++        if (tex0) { *o++ = uv[i * 2] * uvx[0][0] + uvx[0][1]; *o++ = uv[i * 2 + 1] * uvx[0][2] + uvx[0][3]; }
++        if (tex1) { *o++ = uv[i * 2] * uvx[1][0] + uvx[1][1]; *o++ = uv[i * 2 + 1] * uvx[1][2] + uvx[1][3]; }
++        if (fog) {
++            *o++ = fog_r; *o++ = fog_g; *o++ = fog_b; *o++ = DKR360_U8F(vt->fog);
++        }
++        for (int j = 0; j < ninputs; j++) {
++            switch (mode[j][0]) {
++                case 0: *o++ = cv[j][0][0]; *o++ = cv[j][0][1]; *o++ = cv[j][0][2]; break;
++                case 1: *o++ = DKR360_U8F(vt->color.r); *o++ = DKR360_U8F(vt->color.g); *o++ = DKR360_U8F(vt->color.b); break;
++                default: { const float a = DKR360_U8F(vt->color.a); *o++ = a; *o++ = a; *o++ = a; break; }
++            }
++            if (nk > 1) {
++                *o++ = mode[j][1] == 0 ? cv[j][1][3] : DKR360_U8F(vt->color.a);
++            }
++        }
++    }
++    buf_vbo_len = (size_t)(o - buf_vbo);
++    buf_vbo_num_tris++;
++}
++
++static void dkr_emit_tri(const struct LoadedVertex *v0, const struct LoadedVertex *v1, const struct LoadedVertex *v2) {
++    const struct LoadedVertex *vs[3] = { v0, v1, v2 };
++    const float uv[6] = { v0->u, v0->v, v1->u, v1->v, v2->u, v2->v };
++    dkr360_emit_core(vs, uv);
++}
++
++/* The sign of the triangle's area on the screen, for triangles with every w above 0: what dkr_ndc_cross makes of x / w
++ * and y / w, without the six divides (the cross product of the homogeneous rows, over w0 w1 w2 above 0). */
++static inline float dkr360_tri_area_sign(const struct LoadedVertex *a, const struct LoadedVertex *b,
++                                         const struct LoadedVertex *c) {
++    return a->x * (b->y * c->w - c->y * b->w) + b->x * (c->y * a->w - a->y * c->w) +
++           c->x * (a->y * b->w - b->y * a->w);
++}
++#else
  static void dkr_emit_tri(const struct LoadedVertex *v0,
                           const struct LoadedVertex *v1,
                           const struct LoadedVertex *v2) {
-@@ -4378,6 +4507,10 @@ static void dkr_emit_tri(const struct LoadedVertex *v0,
+@@ -4378,6 +4654,10 @@ static void dkr_emit_tri(const struct LoadedVertex *v0,
      software_far_clamp =
          mdkr_render_backend() == MDKR_BACKEND_WEBGPU &&
          !gfx_webgpu_unclipped_depth_supported();
@@ -582,7 +743,7 @@ index 7c42adea..01693eec 100644
  #endif
      if (buf_vbo_num_tris + 1 > DKR_MAX_BUFFERED) gfx_flush();
  
-@@ -4478,10 +4611,10 @@ static void dkr_emit_tri(const struct LoadedVertex *v0,
+@@ -4478,10 +4758,10 @@ static void dkr_emit_tri(const struct LoadedVertex *v0,
          }
  
          if (cur.use_fog) {
@@ -597,7 +758,7 @@ index 7c42adea..01693eec 100644
          }
  
          for (int j = 0; j < cur.num_inputs; j++) {
-@@ -4499,11 +4632,11 @@ static void dkr_emit_tri(const struct LoadedVertex *v0,
+@@ -4499,17 +4779,18 @@ static void dkr_emit_tri(const struct LoadedVertex *v0,
                      default:                     memset(&tmp, 0, sizeof(tmp)); c = tmp; break;
                  }
                  if (k == 0) {
@@ -613,7 +774,14 @@ index 7c42adea..01693eec 100644
                  }
              }
          }
-@@ -4677,6 +4810,12 @@ static float dkr_ndc_cross(const struct LoadedVertex *a,
+     }
+     buf_vbo_num_tris++;
+ }
++#endif /* __XSDK__ */
+ 
+ /* ------------------------------------------------------------------------- */
+ /* Near-plane clipping                                                       */
+@@ -4677,6 +4958,12 @@ static float dkr_ndc_cross(const struct LoadedVertex *a,
  /* SP: gSPVertexDKR (G_VTX)                                                   */
  /* ------------------------------------------------------------------------- */
  
@@ -626,7 +794,7 @@ index 7c42adea..01693eec 100644
  static void dkr_sp_vertex(const Vertex *verts, int n, bool append,
                            const float (*position_overrides)[3],
                            const struct RGBA *color_overrides) {
-@@ -4747,7 +4886,9 @@ static void dkr_sp_vertex(const Vertex *verts, int n, bool append,
+@@ -4747,7 +5034,9 @@ static void dkr_sp_vertex(const Vertex *verts, int n, bool append,
          d->model_z = z;
          d->world_x = d->world_y = d->world_z = 0.0f;
          d->world_valid = false;
@@ -637,7 +805,7 @@ index 7c42adea..01693eec 100644
              rsp.active_slot >= 0 && rsp.active_slot < 3 &&
              rsp.shadow_matrix_valid[rsp.active_slot]) {
              const float (*world)[4] =
-@@ -4767,7 +4908,7 @@ static void dkr_sp_vertex(const Vertex *verts, int n, bool append,
+@@ -4767,7 +5056,7 @@ static void dkr_sp_vertex(const Vertex *verts, int n, bool append,
                  isfinite(d->world_z);
          }
          d->normal_x = d->normal_y = d->normal_z = 0.0f;
@@ -646,7 +814,42 @@ index 7c42adea..01693eec 100644
              float nx = normal_stream[i].x;
              float ny = normal_stream[i].y;
              float nz = normal_stream[i].z;
-@@ -5025,6 +5166,19 @@ static void dkr_sp_polygon(const Triangle *tris, int num_tris, bool tex_enabled,
+@@ -4882,6 +5171,34 @@ static void dkr_sp_polygon(const Triangle *tris, int num_tris, bool tex_enabled,
+             continue;
+         }
+ 
++#ifdef __XSDK__
++        if (!g_pcRemasterFX && !dkr_trace_this_frame && !gfx_world_fx_trace_enabled() && dkr_clip_mode_get() != 2) {
++            /* dkr360: no vertex copies, no remaster work; the vertices stay in rsp.loaded and the corner's texture
++             * coordinates go beside them. Triangles that need the near clip take the general path below. */
++            const struct LoadedVertex *pa = &rsp.loaded[i0], *pb = &rsp.loaded[i1], *pc = &rsp.loaded[i2];
++            if (pa->w > 0.0f && pb->w > 0.0f && pc->w > 0.0f && dkr_clip_dist(pa) >= 0.0f &&
++                dkr_clip_dist(pb) >= 0.0f && dkr_clip_dist(pc) >= 0.0f) {
++                if (!(t->flags & BACKFACE_DRAW) && dkr360_tri_area_sign(pa, pb, pc) < 0.0f) {
++                    culled++;
++                    continue;
++                }
++                float uv[6] = { (float)(int16_t)t->uv0.u, (float)(int16_t)t->uv0.v, (float)(int16_t)t->uv1.u,
++                                (float)(int16_t)t->uv1.v, (float)(int16_t)t->uv2.u, (float)(int16_t)t->uv2.v };
++                if (uv_offset != NULL && i < 16) {
++                    if ((uv_offset_mask_u & (1u << i)) != 0u) {
++                        uv[0] += uv_offset[0]; uv[2] += uv_offset[0]; uv[4] += uv_offset[0];
++                    }
++                    if ((uv_offset_mask_v & (1u << i)) != 0u) {
++                        uv[1] += uv_offset[1]; uv[3] += uv_offset[1]; uv[5] += uv_offset[1];
++                    }
++                }
++                const struct LoadedVertex *vs3[3] = { pa, pb, pc };
++                dkr360_emit_core(vs3, uv);
++                emitted++;
++                continue;
++            }
++        }
++#endif
+         struct LoadedVertex a = rsp.loaded[i0];
+         struct LoadedVertex b = rsp.loaded[i1];
+         struct LoadedVertex c = rsp.loaded[i2];
+@@ -5025,6 +5342,19 @@ static void dkr_sp_polygon(const Triangle *tris, int num_tris, bool tex_enabled,
           * the perspective divide is always well defined. A triangle straddling
           * the plane becomes a quad; one entirely behind it disappears here (that
           * is the plane doing its job, not a cull). */
@@ -666,7 +869,7 @@ index 7c42adea..01693eec 100644
          {
              struct LoadedVertex tri[3];
              struct LoadedVertex poly[DKR_CLIP_MAX_VERTS];
-@@ -5100,7 +5254,12 @@ static void dkr_sp_polygon(const Triangle *tris, int num_tris, bool tex_enabled,
+@@ -5100,7 +5430,12 @@ static void dkr_sp_polygon(const Triangle *tris, int num_tris, bool tex_enabled,
      }
      if (dkr_trace_this_frame)
          DTRACE("  polygon: emitted=%d culled=%d oob=%d of %d", emitted, culled, oob, num_tris);
@@ -679,7 +882,7 @@ index 7c42adea..01693eec 100644
  }
  
  /* ------------------------------------------------------------------------- */
-@@ -5874,7 +6033,16 @@ static void dkr_dp_fill_rectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_t
+@@ -5874,7 +6209,16 @@ static void dkr_dp_fill_rectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_t
       * that covers the complete logical framebuffer; full-screen menu panels
       * drawn after SAFE_2D tagging remain undistorted in the safe area.
       */
@@ -697,7 +900,7 @@ index 7c42adea..01693eec 100644
          (cyc == G_CYC_FILL || cyc == G_CYC_COPY) &&
          ulx <= 0 && uly <= 0 &&
          lrx >= DESIRED_SCREEN_WIDTH * 4 &&
-@@ -6017,12 +6185,13 @@ static void dkr_dl_fault(const char *reason, const Gfx *cmd, int depth) {
+@@ -6017,12 +6361,13 @@ static void dkr_dl_fault(const char *reason, const Gfx *cmd, int depth) {
      const bool readable = dkr_dl_command_aligned(cmd) &&
                            dkr_room_for(cmd, sizeof(Gfx));
      fprintf(stderr,
@@ -713,7 +916,7 @@ index 7c42adea..01693eec 100644
      fflush(stderr);
      if (strict) {
          abort();
-@@ -6795,8 +6964,10 @@ bool gfx_dkr_capture_future_deformations(const Gfx *begin, const Gfx *end,
+@@ -6795,8 +7140,10 @@ bool gfx_dkr_capture_future_deformations(const Gfx *begin, const Gfx *end,
      rsp.draw_space = G_MTX_DKR_SPACE_WORLD;
      rsp.world_safe_region = false;
      gfx_presentation_packet_capture_begin(authored_tick);
@@ -724,7 +927,7 @@ index 7c42adea..01693eec 100644
      /* The authored-rate table is filled by the game tick that built the task
       * this walk just read, and is consumed only by that walk. Clearing it here
       * bounds a registration's life to one tick: a tick whose walk never runs
-@@ -7212,7 +7383,7 @@ static const float *dkr_replay_uv_scroll_offset(const Triangle *tris,
+@@ -7212,7 +7559,7 @@ static const float *dkr_replay_uv_scroll_offset(const Triangle *tris,
              dkr_last_walked_authored_tick, &target_tick)) {
          return NULL;
      }
@@ -733,7 +936,7 @@ index 7c42adea..01693eec 100644
      if (original == NULL) {
          return NULL;
      }
-@@ -7578,7 +7749,7 @@ static void dkr_run_dl(Gfx *cmd, int depth, int limit) {
+@@ -7578,7 +7925,7 @@ static void dkr_run_dl(Gfx *cmd, int depth, int limit) {
                  effective_draw_space == G_MTX_DKR_SPACE_WORLD;
              void *ma = dkr_resolve(cmd->words.w1);
              const void *matrix_identity =
@@ -742,7 +945,7 @@ index 7c42adea..01693eec 100644
              float replay_world[4][4];
              bool object_overridden = false;
              /* A topology-keyed root that the choke point already refused AND
-@@ -8073,7 +8244,7 @@ static void dkr_run_dl(Gfx *cmd, int depth, int limit) {
+@@ -8073,7 +8420,7 @@ static void dkr_run_dl(Gfx *cmd, int depth, int limit) {
              bool append = (p & 1) != 0;
              const Vertex *v = (const Vertex *)dkr_resolve(cmd->words.w1);
              const void *vertex_identity =
@@ -751,7 +954,7 @@ index 7c42adea..01693eec 100644
              const Vertex *vertex_source = v;
              int retained_n = n;
              bool retained_packet_vertex = false;
-@@ -8411,9 +8582,11 @@ static void dkr_run_dl(Gfx *cmd, int depth, int limit) {
+@@ -8411,9 +8758,11 @@ static void dkr_run_dl(Gfx *cmd, int depth, int limit) {
                  /* retained_n is the count the retained/override arrays were
                   * actually filled to; n is the display list's request. Passing n
                   * would transform whatever the stack held past that point. */
@@ -763,7 +966,7 @@ index 7c42adea..01693eec 100644
              }
              break;
          }
-@@ -8466,8 +8639,10 @@ static void dkr_run_dl(Gfx *cmd, int depth, int limit) {
+@@ -8466,8 +8815,10 @@ static void dkr_run_dl(Gfx *cmd, int depth, int limit) {
                  }
                  dkr_begin_primitive(
                      rsp.draw_space != G_MTX_DKR_SPACE_WORLD);
@@ -774,7 +977,7 @@ index 7c42adea..01693eec 100644
              }
              break;
          }
-@@ -9278,7 +9453,9 @@ void gfx_run(Gfx *dl) {
+@@ -9278,7 +9629,9 @@ void gfx_run(Gfx *dl) {
              0
          };
          memcpy(saved_segments, gfx_segment_table, sizeof(saved_segments));
@@ -784,7 +987,7 @@ index 7c42adea..01693eec 100644
          memcpy(gfx_segment_table, saved_segments, sizeof(saved_segments));
          dkr_last_world_primitive = scan.last_world;
      }
-@@ -9555,15 +9732,21 @@ bool gfx_dkr_replay_walk_endpoint(
+@@ -9555,15 +9908,21 @@ bool gfx_dkr_replay_walk_endpoint(
      const GfxShadowReplayViewProjection *overrides, size_t override_count) {
      /* Delayed-endpoint negative control: alpha 0 with object substitution on,
       * and the ONLY other caller entitled to the endpoint exemption. */
@@ -811,10 +1014,10 @@ index 7c42adea..01693eec 100644
  
  void gfx_dkr_replay_invalidate(void) {
 diff --git a/platform/fast3d/gfx_retained_task.c b/platform/fast3d/gfx_retained_task.c
-index 17cf8b9a..8b810510 100644
+index 17cf8b9a..246ebd87 100644
 --- a/platform/fast3d/gfx_retained_task.c
 +++ b/platform/fast3d/gfx_retained_task.c
-@@ -301,7 +301,31 @@ bool gfx_retained_task_capture_commit(
+@@ -301,7 +301,41 @@ bool gfx_retained_task_capture_commit(
          return false;
      }
      next.arena = capture_arena;
@@ -831,7 +1034,17 @@ index 17cf8b9a..8b810510 100644
 +        } else {
 +            used = (used + 4095u) & ~(size_t)4095u;
 +        }
-+        memcpy(next.arena, s_capture.arena, used);
++        {
++            extern void dkr360_prof_add(int slot, unsigned long long ticks);
++            unsigned int hi, lo;
++            __asm__ volatile("mftbu %0" : "=r"(hi));
++            __asm__ volatile("mftb %0" : "=r"(lo));
++            const unsigned long long t0 = ((unsigned long long)hi << 32) | lo;
++            memcpy(next.arena, s_capture.arena, used);
++            __asm__ volatile("mftbu %0" : "=r"(hi));
++            __asm__ volatile("mftb %0" : "=r"(lo));
++            dkr360_prof_add(9 + 5 + 0, (((unsigned long long)hi << 32) | lo) - t0);
++        }
 +        s_copied_bytes += used;
 +        if (++s_copies % 1800u == 0u) {
 +            xsdk_log_write("dkr360: replay copies of the arena %u KB on average (of %u KB)",

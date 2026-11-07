@@ -18,6 +18,8 @@ enum {
 	DKR360_PROF_VTX,      /* inside walks: G_VTX, vertex transform and lighting */
 	DKR360_PROF_POLY,     /* inside walks: G_TRIN, triangle setup (holds bind and flush) */
 	DKR360_PROF_SCAN,     /* inside walks: the display list prescans */
+	DKR360_PROF_COPY,     /* inside endframe: the arena copy for the replays */
+	DKR360_PROF_PRESENT,  /* inside endframe: front buffer, resolve, present */
 	DKR360_PROF_COUNT
 };
 

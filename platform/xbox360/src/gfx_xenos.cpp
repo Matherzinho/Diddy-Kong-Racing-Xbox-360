@@ -1152,6 +1152,7 @@ void XenosEndFrame(void) {
     DKR360_PROF_BEGIN(gpu);
     uint32_t address = 0;
     Oot360_Phase("xenos: present wait");
+    DKR360_PROF_BEGIN(present);
     if (X.headless) {
         // Xenia without a display: the picture goes nowhere; the game's own pacer paces the frames.
     } else if (NT_SUCCESS(xsdk_present_begin(&address, kBeginTimeoutMs))) {
@@ -1163,6 +1164,7 @@ void XenosEndFrame(void) {
         xsdk_gpu_resolve(xsdk_present_buffer_address(0), X.width, X.height, 0xFF000000);
     }
     ResetDrawState();
+    DKR360_PROF_END(present, DKR360_PROF_PRESENT);
     const uint32_t fence = xsdk_gpu_fence();
     X.frameFence[X.ringIndex] = fence;
     X.fenceOfFrame[X.frame] = fence;

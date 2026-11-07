@@ -12,7 +12,7 @@ static unsigned sFrames, sSlowFrames;
 
 static const char *const kNames[DKR360_PROF_COUNT] = { "walk", "replay", "endframe", "audio", "pace",
 						       "texture", "gpuwait", "menu", "tick",
-						       "flush", "bind", "vtx", "poly", "scan" };
+						       "flush", "bind", "vtx", "poly", "scan", "copy", "present" };
 
 void dkr360_prof_add(int slot, unsigned long long ticks) {
 	if (slot >= 0 && slot < DKR360_PROF_COUNT) {

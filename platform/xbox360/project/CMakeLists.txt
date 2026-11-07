@@ -82,6 +82,9 @@ set(LIB_SOURCES "${GB}/lib/stb/stb_image_impl.c" "${GB}/lib/miniz/miniz.c" "${GB
 	"${GB}/lib/imgui/imgui.cpp" "${GB}/lib/imgui/imgui_draw.cpp" "${GB}/lib/imgui/imgui_tables.cpp"
 	"${GB}/lib/imgui/imgui_widgets.cpp")
 set_source_files_properties(${LIB_SOURCES} PROPERTIES COMPILE_OPTIONS "-w")
+# The renderer's math (matrices, clipping, vertex packing) may fuse a * b + c into one fmadd: the toolchain file turns
+# it off for the game's physics (bit-exact trig and collisions), but a picture's last bit doesn't matter.
+set_source_files_properties("${GB}/platform/fast3d/gfx_pc_dkr.c" PROPERTIES COMPILE_OPTIONS "-ffp-contract=fast")
 
 # Xenos shaders (the Star Fox port's, built in 256 variants of fast3d.frag)
 set(XENOS_SHADER_DIR "${X360}/src/xenos")

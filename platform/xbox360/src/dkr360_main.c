@@ -93,6 +93,11 @@ static void *GameThread(void *arg) {
 		const int want = dkr360_language_resolve(LanguageSetting());
 		sRomLanguage = dkr360_rom_available(want) ? want : 0;
 		argv[2] = (char *)kRoms[sRomLanguage];
+		if (sRomLanguage != 0) {
+			/* A translation is a modified ROM: Golden Balloon checks the whole image against its reference's hash
+			 * and refuses it unless told (platform/rom_validation.c, a developer override). Only for these ROMs. */
+			setenv("MDKR_ROM_ALLOW_MODIFIED", "1", 1);
+		}
 		xsdk_log_write("dkr360: language %d, ROM %s%s", want, kRoms[sRomLanguage],
 			       sRomLanguage != want ? " (the translated ROM isn't there)" : "");
 	}

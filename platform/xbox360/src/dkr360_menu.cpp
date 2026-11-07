@@ -63,7 +63,8 @@ bool SetInt(MdkrVideoKey key, int v) {
 // The menu's own: the FPS counter and the language, in dkr360\console.ini (dkr360_main.c reads the language too,
 // to pick the game's ROM).
 bool sShowFps = false;
-int sLanguageSetting = 0; // 0 automatic (the console's), 1 English, 2 Portuguese (Brazil), 3 Spanish
+int sLanguageSetting = 0; // 0 automatic (the console's), 1 English, 2 Portuguese (Brazil), 3 Spanish: the saved one
+int sLanguagePreview = -1; // the one being browsed in the Language row, not saved until A confirms it; -1 none
 
 void SaveConsoleSettings() {
     if (FILE* f = fopen("dkr360/console.ini", "w")) {
@@ -75,7 +76,7 @@ void SaveConsoleSettings() {
 // The language the menu shows: 0 English, 1 Portuguese, 2 Spanish (dkr360_main.c, the same rule for the ROM).
 extern "C" int dkr360_language_resolve(int setting);
 int Lang() {
-    return dkr360_language_resolve(sLanguageSetting);
+    return dkr360_language_resolve(sLanguagePreview >= 0 ? sLanguagePreview : sLanguageSetting);
 }
 
 // One text in the three languages, picked when the menu is built (Tabs) or drawn.
@@ -135,6 +136,7 @@ struct Item {
 };
 
 enum { ID_NONE, ID_DEFAULTS, ID_LANGUAGE, ID_RESTART };
+enum { CONFIRM_ACTION, CONFIRM_LANGUAGE };
 
 struct Tab {
     const char* label;
@@ -271,19 +273,18 @@ std::vector<Tab>& Tabs() {
     lang.kind = K_CHOICE;
     lang.id = ID_LANGUAGE;
     lang.label = L("Language", "Idioma", "Idioma");
-    lang.desc = L("This menu's language and the game's. The game's texts in Portuguese or Spanish come from its "
-                  "translated ROM (dkr_pt.z64 or dkr_es.z64 beside the .xex); switching to them restarts the game.",
-                  "O idioma deste menu e do jogo. Os textos do jogo em português ou espanhol vêm da ROM traduzida "
-                  "(dkr_pt.z64 ou dkr_es.z64 ao lado do .xex); trocar para eles reinicia o jogo.",
-                  "El idioma de este menú y del juego. Los textos del juego en portugués o español vienen de su ROM "
-                  "traducida (dkr_pt.z64 o dkr_es.z64 junto al .xex); cambiar a ellos reinicia el juego.");
+    lang.desc = L("Left/right shows each language in this menu; A confirms it. The game's own texts follow after a "
+                  "restart, from the language's translated ROM (dkr_pt.z64 or dkr_es.z64 beside the .xex).",
+                  "Esquerda/direita mostra cada idioma neste menu; A confirma. Os textos do próprio jogo mudam "
+                  "depois de reiniciar, com a ROM traduzida do idioma (dkr_pt.z64 ou dkr_es.z64 ao lado do .xex).",
+                  "Izquierda/derecha muestra cada idioma en este menú; A confirma. Los textos del propio juego "
+                  "cambian tras reiniciar, con la ROM traducida del idioma (dkr_pt.z64 o dkr_es.z64 junto al .xex).");
     lang.choices = { { "0", L("Automatic", "Automático", "Automático") }, { "1", "English" },
                      { "2", "Português (Brasil)" }, { "3", "Español" } };
-    lang.get = [] { return sLanguageSetting; };
+    lang.get = [] { return sLanguagePreview >= 0 ? sLanguagePreview : sLanguageSetting; };
     lang.set = [](int idx) {
-        sLanguageSetting = idx;
-        SaveConsoleSettings();
-        sRebuildTabs = true; // rebuilt in the new language before the next frame (not now: this runs inside a tab)
+        sLanguagePreview = idx; // browsed only; A confirms (ConsoleMenu::CommitLanguage)
+        sRebuildTabs = true;    // rebuilt in that language before the next frame (not now: this runs inside a tab)
     };
     lang.def = -1;
 
@@ -479,8 +480,8 @@ std::string ValueText(const Item& item) {
                 const int have = dkr360_rom_language();
                 std::string v = kNames[have];
                 if (want != have) {
-                    v += dkr360_rom_available(want) ? L(" (restart: A)", " (reiniciar: A)", " (reiniciar: A)")
-                                                    : L(" (no ROM)", " (sem ROM)", " (sin ROM)");
+                    v += dkr360_rom_available(want) ? L(" (after restart)", " (após reiniciar)", " (tras reiniciar)")
+                                                    : L(" (no ROM: stays)", " (sem ROM: continua)", " (sin ROM: sigue)");
                 }
                 return v;
             }
@@ -637,6 +638,11 @@ class ConsoleMenu {
         return mOpen || mBlocked;
     }
 
+    // Anything on screen: otherwise the frame skips Dear ImGui altogether (it was 10 ms a second on the console).
+    bool Visible() const {
+        return mOpen || mFade > 0.0f || sShowFps || mToastTime > 0.0f;
+    }
+
     void Draw(float dt) {
         mFade = std::clamp(mFade + (mOpen ? dt : -dt) * 7.0f, 0.0f, 1.0f);
         if (sShowFps) {
@@ -662,10 +668,43 @@ class ConsoleMenu {
         mRow = 0;
     }
 
+    void TestCommit() {
+        CommitLanguage();
+    }
+
   private:
     void Close() {
         mOpen = false;
         mConfirm = false;
+        if (sLanguagePreview >= 0) {
+            sLanguagePreview = -1; // not confirmed: back to the saved one
+            sRebuildTabs = true;
+        }
+    }
+
+    // A on the Language row: the browsed language becomes the saved one; if the game's own texts need another ROM
+    // (and it is there) the game asks first to restart into it.
+    void CommitLanguage() {
+        if (sLanguagePreview < 0 || sLanguagePreview == sLanguageSetting) {
+            sLanguagePreview = -1;
+            return;
+        }
+        const int want = dkr360_language_resolve(sLanguagePreview);
+        if (want != dkr360_rom_language() && dkr360_rom_available(want)) {
+            mConfirm = true;
+            mConfirmYes = true;
+            mConfirmKind = CONFIRM_LANGUAGE;
+            return;
+        }
+        sLanguageSetting = sLanguagePreview;
+        sLanguagePreview = -1;
+        SaveConsoleSettings();
+        sRebuildTabs = true;
+        if (want != dkr360_rom_language()) {
+            Toast(L("No translated ROM for this language: the game's texts stay as they are",
+                    "Sem ROM traduzida para este idioma: os textos do jogo continuam como estão",
+                    "Sin ROM traducida para este idioma: los textos del juego siguen igual"));
+        }
     }
 
     std::vector<Item>& Items() {
@@ -680,13 +719,19 @@ class ConsoleMenu {
             }
             if (pad.pressed & INPUT_GAMEPAD_A) {
                 mConfirm = false;
-                if (mConfirmYes) {
-                    Item& item = items[mRow];
-                    if (item.id == ID_RESTART) {
+                if (mConfirmKind == CONFIRM_LANGUAGE) {
+                    if (mConfirmYes) {
+                        sLanguageSetting = sLanguagePreview;
+                        sLanguagePreview = -1;
+                        SaveConsoleSettings();
                         dkr360_restart();
                     } else {
-                        item.run();
+                        sLanguagePreview = -1; // declined: back to the saved language
+                        sRebuildTabs = true;
                     }
+                } else if (mConfirmYes) {
+                    Item& item = items[mRow];
+                    item.run();
                     if (item.id == ID_DEFAULTS) {
                         Toast(L("Options restored to their defaults", "Opções restauradas para o padrão",
                                 "Opciones restauradas a sus valores"));
@@ -694,6 +739,10 @@ class ConsoleMenu {
                 }
             } else if (pad.pressed & INPUT_GAMEPAD_B) {
                 mConfirm = false;
+                if (mConfirmKind == CONFIRM_LANGUAGE) {
+                    sLanguagePreview = -1;
+                    sRebuildTabs = true;
+                }
             }
             return;
         }
@@ -719,11 +768,13 @@ class ConsoleMenu {
             mRow = (mRow + 1) % rows;
         }
         Item& item = now[mRow];
-        if (item.id == ID_RESTART) {
-            if ((pad.pressed & INPUT_GAMEPAD_A) && Lang() != dkr360_rom_language() &&
-                dkr360_rom_available(Lang())) {
-                mConfirm = true;
-                mConfirmYes = true;
+        if (item.id == ID_LANGUAGE) {
+            if (pad.left) {
+                Change(item, -1);
+            } else if (pad.right) {
+                Change(item, 1);
+            } else if (pad.pressed & INPUT_GAMEPAD_A) {
+                CommitLanguage();
             }
             return;
         }
@@ -732,6 +783,7 @@ class ConsoleMenu {
                 if (item.confirm) {
                     mConfirm = true;
                     mConfirmYes = false;
+                    mConfirmKind = CONFIRM_ACTION;
                 } else {
                     item.run();
                 }
@@ -944,8 +996,10 @@ class ConsoleMenu {
         const char* title = Items()[mRow].label;
         const ImVec2 ts = Measure(26.0f, title);
         Text(dl, 26.0f, ImVec2(640 - ts.x * 0.5f, 296), Col(255, 220, 70, a), title);
-        const char* question = Items()[mRow].id == ID_RESTART
-                                   ? L("Restart the game now?", "Reiniciar o jogo agora?", "¿Reiniciar el juego ahora?")
+        const char* question = mConfirmKind == CONFIRM_LANGUAGE
+                                   ? L("OK to restart the game to apply the language?",
+                                       "Tudo bem reiniciar o jogo para aplicar o idioma?",
+                                       "¿Reiniciar el juego para aplicar el idioma?")
                                    : L("Are you sure?", "Tem certeza?", "¿Seguro?");
         const ImVec2 qs = Measure(22.0f, question);
         Text(dl, 22.0f, ImVec2(640 - qs.x * 0.5f, 340), Col(245, 232, 215, a), question);
@@ -962,6 +1016,7 @@ class ConsoleMenu {
 
     PadReader mPad;
     bool mOpen = false, mBlocked = false, mConfirm = false, mConfirmYes = false;
+    int mConfirmKind = CONFIRM_ACTION;
     int mTab = 0, mRow = 0;
     float mFade = 0.0f, mScroll = 0.0f, mSelY = -1.0f, mTabX = -1.0f, mTabW = -1.0f;
     const char* mToast = "";
@@ -1039,13 +1094,22 @@ void Init() {
     LoadConsoleSettings();
     // A run nobody holds a pad in (Xenia): the menu open on the tab in game:\dkr360_menu_open.txt, for a capture.
     if (FILE* f = fopen("dkr360_menu_open.txt", "r")) {
-        int tab = 0;
-        if (fscanf(f, "%d", &tab) != 1) {
+        // "tab [language [commit]]": the second number browses that language, the third presses A on it
+        int tab = 0, language = -1, commit = 0;
+        const int got = fscanf(f, "%d %d %d", &tab, &language, &commit);
+        if (got < 1) {
             tab = 0;
         }
         fclose(f);
         sMenu.SetTab(tab);
         sMenu.Open();
+        if (got >= 2 && language >= 0 && language <= 3) {
+            sLanguagePreview = language;
+            sRebuildTabs = true;
+            if (got >= 3 && commit) {
+                sMenu.TestCommit();
+            }
+        }
     }
     sReady = true;
     xsdk_log_write("dkr360 menu: ready");
@@ -1111,7 +1175,8 @@ void dkr360_menu_render(void) {
     sLast = now;
     dt = std::clamp(dt, 0.0001f, 0.1f);
     sMenu.Tick(dt);
-    {
+    static unsigned sDiagFrames;
+    if ((++sDiagFrames % 30) == 1) {
         // Which controllers XAM and SDL see, when that changes (the game reads its pads through SDL).
         static int sLastMask = -1, sLastSdl = -1;
         int mask = 0;
@@ -1128,6 +1193,9 @@ void dkr360_menu_render(void) {
             sLastMask = mask;
             sLastSdl = sdl;
         }
+    }
+    if (!sMenu.Visible()) {
+        return;
     }
     ImGuiIO& io = ImGui::GetIO();
     io.DeltaTime = dt;

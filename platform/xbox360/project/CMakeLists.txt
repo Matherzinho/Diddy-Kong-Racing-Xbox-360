@@ -26,8 +26,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(NOT CMAKE_BUILD_TYPE)
 	set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
-set(CMAKE_C_FLAGS_RELEASE "-O2 -DNDEBUG")
-set(CMAKE_CXX_FLAGS_RELEASE "-O2 -DNDEBUG")
+set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG")
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
 set(GEN "${CMAKE_BINARY_DIR}/generated")
 file(MAKE_DIRECTORY "${GEN}")
 
@@ -132,7 +132,7 @@ add_custom_command(OUTPUT "${GEN}/dkr360_shaders.h"
 
 set(X360_SOURCES
 	"${X360}/src/gfx_xenos.cpp" "${X360}/src/xsdk_glue.c" "${X360}/src/xsdk_posix_stubs.c"
-	"${X360}/src/dkr360_main.c" "${X360}/src/dkr360_stubs.c" "${X360}/src/dkr360_menu.cpp" "${GEN}/dkr360_shaders.h")
+	"${X360}/src/dkr360_main.c" "${X360}/src/dkr360_stubs.c" "${X360}/src/dkr360_prof.c" "${X360}/src/dkr360_menu.cpp" "${GEN}/dkr360_shaders.h")
 
 add_executable(dkr360 ${GAME_SOURCES} ${PLATFORM_SOURCES} ${FAST3D_SOURCES} ${LIB_SOURCES} ${X360_SOURCES})
 target_include_directories(dkr360 PRIVATE

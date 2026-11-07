@@ -7,8 +7,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <xsdk/kernel.h>
 #include <xsdk/log.h>
+#include <xsdk/system.h>
 #include <xsdk/thread.h>
+#include <xsdk/xam.h>
 
 int mdkr64_headless_main(int argc, char **argv);
 void Ssb64_StartHeartbeat(void);
@@ -22,11 +25,77 @@ static int FileExists(const char *path) {
 	return stat(path, &st) == 0;
 }
 
+/* ---- the language: the console menu's setting (dkr360\console.ini, Language=), the ROM it means ---------------- */
+
+/* Each language's ROM beside the .xex: the cartridge's (English), and translated ones the player puts there. */
+static const char *const kRoms[3] = { "dkr.z64", "dkr_pt.z64", "dkr_es.z64" };
+static int sRomLanguage; /* the one loaded: 0 English, 1 Portuguese (Brazil), 2 Spanish */
+
+/* 0 automatic, 1 English, 2 Portuguese, 3 Spanish -> 0 English, 1 Portuguese, 2 Spanish; automatic follows the
+ * console's language. */
+int dkr360_language_resolve(int setting) {
+	if (setting >= 1 && setting <= 3) {
+		return setting - 1;
+	}
+	switch (xsdk_system_language()) {
+	case XSDK_LANGUAGE_PORTUGUESE:
+		return 1;
+	case XSDK_LANGUAGE_SPANISH:
+		return 2;
+	default:
+		return 0;
+	}
+}
+
+int dkr360_rom_language(void) {
+	return sRomLanguage;
+}
+
+int dkr360_rom_available(int language) {
+	struct stat st;
+	return language >= 0 && language < 3 && stat(kRoms[language], &st) == 0;
+}
+
+static int LanguageSetting(void) {
+	int setting = 0;
+	FILE *f = fopen("dkr360/console.ini", "r");
+	if (f) {
+		char line[128];
+		while (fgets(line, sizeof line, f)) {
+			int v;
+			if (sscanf(line, "Language=%d", &v) == 1 && v >= 0 && v <= 3) {
+				setting = v;
+			}
+		}
+		fclose(f);
+	}
+	return setting;
+}
+
+/* Starts this .xex again (the menu, to load another language's ROM). ExLoadedImageName is the kernel's path, e.g.
+ * \Device\Harddisk0\Partition1\Games\DKR\dkr360.xex; game:\ is its folder. */
+void dkr360_restart(void) {
+	const char *name = strrchr(ExLoadedImageName, '\\');
+	char path[256];
+	snprintf(path, sizeof path, "game:\\%s", name ? name + 1 : "dkr360.xex");
+	xsdk_log_write("dkr360: restarting %s for the new language", path);
+	if (xsdk_launch(path, NULL, 0) != 0) {
+		xsdk_log_write("dkr360: restart failed");
+	}
+}
+
 static void *GameThread(void *arg) {
 	(void)arg;
 	xsdk_thread_move(2);
 	static char *argv[8] = { "dkr360", "--rom", "dkr.z64" };
 	int argc = 3;
+	{
+		const int want = dkr360_language_resolve(LanguageSetting());
+		sRomLanguage = dkr360_rom_available(want) ? want : 0;
+		argv[2] = (char *)kRoms[sRomLanguage];
+		xsdk_log_write("dkr360: language %d, ROM %s%s", want, kRoms[sRomLanguage],
+			       sRomLanguage != want ? " (the translated ROM isn't there)" : "");
+	}
 	/* Test runs where nobody holds a pad (Xenia): Golden Balloon's own input script, a line "frame BUTTONS [hold]
 	 * [P1-P4]" each (tests/input_scripts/), and its autopilot, which drives the racing line. */
 	if (FileExists("dkr360_autopad.txt")) {

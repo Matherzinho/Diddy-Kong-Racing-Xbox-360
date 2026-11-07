@@ -60,13 +60,33 @@ bool SetInt(MdkrVideoKey key, int v) {
     return Set(key, buf);
 }
 
-// The menu's own: the FPS counter, in dkr360\console.ini.
+// The menu's own: the FPS counter and the language, in dkr360\console.ini (dkr360_main.c reads the language too,
+// to pick the game's ROM).
 bool sShowFps = false;
+int sLanguageSetting = 0; // 0 automatic (the console's), 1 English, 2 Portuguese (Brazil), 3 Spanish
 
 void SaveConsoleSettings() {
     if (FILE* f = fopen("dkr360/console.ini", "w")) {
-        fprintf(f, "ShowFps=%d\n", sShowFps ? 1 : 0);
+        fprintf(f, "ShowFps=%d\nLanguage=%d\n", sShowFps ? 1 : 0, sLanguageSetting);
         fclose(f);
+    }
+}
+
+// The language the menu shows: 0 English, 1 Portuguese, 2 Spanish (dkr360_main.c, the same rule for the ROM).
+extern "C" int dkr360_language_resolve(int setting);
+int Lang() {
+    return dkr360_language_resolve(sLanguageSetting);
+}
+
+// One text in the three languages, picked when the menu is built (Tabs) or drawn.
+const char* L(const char* en, const char* pt, const char* es) {
+    switch (Lang()) {
+        case 1:
+            return pt;
+        case 2:
+            return es;
+        default:
+            return en;
     }
 }
 
@@ -77,6 +97,8 @@ void LoadConsoleSettings() {
             int v;
             if (sscanf(line, "ShowFps=%d", &v) == 1) {
                 sShowFps = v != 0;
+            } else if (sscanf(line, "Language=%d", &v) == 1 && v >= 0 && v <= 3) {
+                sLanguageSetting = v;
             }
         }
         fclose(f);
@@ -109,7 +131,10 @@ struct Item {
     const char* info;
     // Restore defaults: the choice index or percentage to go back to (-1: none)
     int def;
+    int id; // ID_*: items the menu treats apart
 };
+
+enum { ID_NONE, ID_DEFAULTS, ID_LANGUAGE, ID_RESTART };
 
 struct Tab {
     const char* label;
@@ -226,16 +251,58 @@ void RestoreDefaults() {
     }
 }
 
+std::vector<Tab> sTabs;
+bool sRebuildTabs = false;
+
+// The game's language: the ROM dkr360_main.c loaded for it, and whether the chosen one is a restart away.
+extern "C" int dkr360_rom_language(void);           // 0 English (the cartridge's), 1 Portuguese, 2 Spanish
+extern "C" int dkr360_rom_available(int language);   // its translated ROM is beside the .xex
+extern "C" void dkr360_restart(void);
+
 std::vector<Tab>& Tabs() {
-    static std::vector<Tab> sTabs;
     if (!sTabs.empty()) {
         return sTabs;
     }
+    const char* on = L("On", "Ligado", "Activado");
+    const char* off = L("Off", "Desligado", "Desactivado");
+    const char* original = L("Original", "Original", "Original");
+
+    Item lang{};
+    lang.kind = K_CHOICE;
+    lang.id = ID_LANGUAGE;
+    lang.label = L("Language", "Idioma", "Idioma");
+    lang.desc = L("This menu's language and the game's. The game's texts in Portuguese or Spanish come from its "
+                  "translated ROM (dkr_pt.z64 or dkr_es.z64 beside the .xex); switching to them restarts the game.",
+                  "O idioma deste menu e do jogo. Os textos do jogo em português ou espanhol vêm da ROM traduzida "
+                  "(dkr_pt.z64 ou dkr_es.z64 ao lado do .xex); trocar para eles reinicia o jogo.",
+                  "El idioma de este menú y del juego. Los textos del juego en portugués o español vienen de su ROM "
+                  "traducida (dkr_pt.z64 o dkr_es.z64 junto al .xex); cambiar a ellos reinicia el juego.");
+    lang.choices = { { "0", L("Automatic", "Automático", "Automático") }, { "1", "English" },
+                     { "2", "Português (Brasil)" }, { "3", "Español" } };
+    lang.get = [] { return sLanguageSetting; };
+    lang.set = [](int idx) {
+        sLanguageSetting = idx;
+        SaveConsoleSettings();
+        sRebuildTabs = true; // rebuilt in the new language before the next frame (not now: this runs inside a tab)
+    };
+    lang.def = -1;
+
+    Item gameText = Info(L("Game texts", "Textos do jogo", "Textos del juego"), "",
+                         L("The language the game's own texts are in now. Missing a translated ROM, the game "
+                           "stays in English.",
+                           "O idioma em que os textos do próprio jogo estão agora. Sem a ROM traduzida, o jogo "
+                           "fica em inglês.",
+                           "El idioma en que están ahora los textos del propio juego. Sin la ROM traducida, el "
+                           "juego queda en inglés."));
+    gameText.id = ID_RESTART;
+
     Item fps{};
     fps.kind = K_CHOICE;
-    fps.label = "Show FPS counter";
-    fps.desc = "A small frames-per-second counter in the top right corner of the screen.";
-    fps.choices = { { "0", "Off" }, { "1", "On" } };
+    fps.label = L("Show FPS counter", "Mostrar contador de FPS", "Mostrar contador de FPS");
+    fps.desc = L("A small frames-per-second counter in the top right corner of the screen.",
+                 "Um pequeno contador de quadros por segundo no canto superior direito da tela.",
+                 "Un pequeño contador de fotogramas por segundo en la esquina superior derecha de la pantalla.");
+    fps.choices = { { "0", off }, { "1", on } };
     fps.get = [] { return sShowFps ? 1 : 0; };
     fps.set = [](int idx) {
         sShowFps = idx == 1;
@@ -243,80 +310,154 @@ std::vector<Tab>& Tabs() {
     };
     fps.def = 0;
 
-    sTabs.push_back({ "General",
+    Item defaults = Action(L("Restore defaults", "Restaurar padrões", "Restaurar valores"),
+                           L("Puts every option of this menu back to its starting value.",
+                             "Volta todas as opções deste menu ao valor inicial.",
+                             "Devuelve todas las opciones de este menú a su valor inicial."),
+                           [] { RestoreDefaults(); }, true);
+    defaults.id = ID_DEFAULTS;
+
+    sTabs.push_back({ L("General", "Geral", "General"),
                       {
+                          lang,
+                          gameText,
                           fps,
-                          NumberChoice("Rumble", "Controller vibration when racers hit, boost or get hit.",
-                                       MDKR_INPUT_RUMBLE_ENABLED, { { "1", "On" }, { "0", "Off" } }),
-                          Action("Restore defaults", "Puts every option of this menu back to its starting value.",
-                                 [] { RestoreDefaults(); }, true),
-                          Action("Quit to dashboard",
-                                 "Leaves the game. Progress the game hasn't saved yet is lost.",
+                          NumberChoice(L("Rumble", "Vibração", "Vibración"),
+                                       L("Controller vibration when racers hit, boost or get hit.",
+                                         "O controle vibra em batidas, turbos e quando você é atingido.",
+                                         "El mando vibra en choques, turbos y cuando te golpean."),
+                                       MDKR_INPUT_RUMBLE_ENABLED, { { "1", on }, { "0", off } }),
+                          defaults,
+                          Action(L("Quit to dashboard", "Sair para o dashboard", "Salir al panel"),
+                                 L("Leaves the game. Progress the game hasn't saved yet is lost.",
+                                   "Sai do jogo. O progresso que o jogo ainda não salvou é perdido.",
+                                   "Sale del juego. El progreso que el juego aún no guardó se pierde."),
                                  [] { platform_request_exit(0); }, true),
                       } });
     sTabs.push_back(
-        { "Video",
+        { L("Video", "Vídeo", "Vídeo"),
           {
-              TextChoice("Aspect ratio",
-                         "16:9 fills the screen and shows more of the track at the sides. 4:3 is the original "
-                         "picture, with black bars.",
-                         MDKR_VIDEO_ASPECT, { { "auto", "16:9 (widescreen)" }, { "4:3", "4:3 (original)" } }),
-              Item{ K_CHOICE, "Frame rate",
-                    "60 smooths the motion with in-between frames; the race itself keeps its original speed. 30 is "
-                    "the game's original frame rate.",
-                    GetFrameRate, SetFrameRate, { { "60", "60 (smooth)" }, { "30", "30 (original)" } } },
-              NumberChoice("HUD placement",
-                           "At the edges of a widescreen picture, or in the centre 4:3 frame as on the N64.",
-                           MDKR_VIDEO_WIDESCREEN_HUD, { { "1", "Screen edges" }, { "0", "Centre 4:3" } }, 0),
-              TextChoice("Field of view",
-                         "How wide the race camera sees. Original keeps every track's own lens.",
+              TextChoice(L("Aspect ratio", "Proporção da tela", "Relación de aspecto"),
+                         L("16:9 fills the screen and shows more of the track at the sides. 4:3 is the original "
+                           "picture, with black bars.",
+                           "16:9 ocupa a tela toda e mostra mais da pista nas laterais. 4:3 é a imagem original, com "
+                           "barras pretas.",
+                           "16:9 llena la pantalla y muestra más de la pista a los lados. 4:3 es la imagen original, "
+                           "con barras negras."),
+                         MDKR_VIDEO_ASPECT,
+                         { { "auto", L("16:9 (widescreen)", "16:9 (widescreen)", "16:9 (panorámica)") },
+                           { "4:3", "4:3 (original)" } }),
+              Item{ K_CHOICE, L("Frame rate", "Taxa de quadros", "Fotogramas por segundo"),
+                    L("60 smooths the motion with in-between frames; the race itself keeps its original speed. 30 is "
+                      "the game's original frame rate.",
+                      "60 suaviza o movimento com quadros intermediários; a corrida mantém a velocidade original. 30 "
+                      "é a taxa original do jogo.",
+                      "60 suaviza el movimiento con fotogramas intermedios; la carrera mantiene su velocidad original. "
+                      "30 es la tasa original del juego."),
+                    GetFrameRate, SetFrameRate,
+                    { { "60", L("60 (smooth)", "60 (suave)", "60 (suave)") }, { "30", "30 (original)" } } },
+              NumberChoice(L("HUD placement", "Posição do HUD", "Posición del HUD"),
+                           L("At the edges of a widescreen picture, or in the centre 4:3 frame as on the N64.",
+                             "Nas bordas da imagem widescreen, ou no quadro 4:3 central como no N64.",
+                             "En los bordes de la imagen panorámica, o en el cuadro 4:3 central como en la N64."),
+                           MDKR_VIDEO_WIDESCREEN_HUD,
+                           { { "1", L("Screen edges", "Bordas da tela", "Bordes de la pantalla") },
+                             { "0", L("Centre 4:3", "Centro 4:3", "Centro 4:3") } },
+                           0),
+              TextChoice(L("Field of view", "Campo de visão", "Campo de visión"),
+                         L("How wide the race camera sees. Original keeps every track's own lens.",
+                           "Quanto a câmera da corrida enxerga. Original mantém a lente de cada pista.",
+                           "Cuánto ve la cámara de la carrera. Original mantiene la lente de cada pista."),
                          MDKR_VIDEO_GAMEPLAY_FOV,
-                         { { "authored", "Original" }, { "70", "70" }, { "80", "80" }, { "90", "90" } }),
-              NumberChoice("Draw distance",
-                           "How far ahead scenery, bananas and balloons appear. Farther costs some speed.",
+                         { { "authored", original }, { "70", "70" }, { "80", "80" }, { "90", "90" } }),
+              NumberChoice(L("Draw distance", "Distância de desenho", "Distancia de dibujado"),
+                           L("How far ahead scenery, bananas and balloons appear. Farther costs some speed.",
+                             "A que distância cenário, bananas e balões aparecem. Mais longe custa desempenho.",
+                             "A qué distancia aparecen escenario, plátanos y globos. Más lejos cuesta rendimiento."),
                            MDKR_ENH_DRAW_DISTANCE,
-                           { { "100", "Original" }, { "150", "150%" }, { "200", "200%" }, { "400", "400%" } }),
-              NumberChoice("Speedometer", "Shows your speed during races.", MDKR_ENH_SPEEDOMETER,
-                           { { "0", "Off" }, { "1", "On" } }),
+                           { { "100", original }, { "150", "150%" }, { "200", "200%" }, { "400", "400%" } }),
+              NumberChoice(L("Speedometer", "Velocímetro", "Velocímetro"),
+                           L("Shows your speed during races.", "Mostra sua velocidade nas corridas.",
+                             "Muestra tu velocidad en las carreras."),
+                           MDKR_ENH_SPEEDOMETER, { { "0", off }, { "1", on } }),
           } });
     sTabs.back().items[1].def = 0;
-    sTabs.push_back({ "Audio",
+    sTabs.push_back({ L("Audio", "Áudio", "Audio"),
                       {
-                          Percent("Master volume", "The volume of the whole game.", MDKR_AUDIO_MASTER_VOLUME, 85),
-                          Percent("Music", "The volume of the music.", MDKR_AUDIO_MUSIC_VOLUME, 100),
-                          Percent("Sound effects", "Engines, items, voices and everything else.",
+                          Percent(L("Master volume", "Volume geral", "Volumen general"),
+                                  L("The volume of the whole game.", "O volume do jogo todo.",
+                                    "El volumen de todo el juego."),
+                                  MDKR_AUDIO_MASTER_VOLUME, 85),
+                          Percent(L("Music", "Música", "Música"),
+                                  L("The volume of the music.", "O volume das músicas.", "El volumen de la música."),
+                                  MDKR_AUDIO_MUSIC_VOLUME, 100),
+                          Percent(L("Sound effects", "Efeitos sonoros", "Efectos de sonido"),
+                                  L("Engines, items, voices and everything else.",
+                                    "Motores, itens, vozes e todo o resto.",
+                                    "Motores, objetos, voces y todo lo demás."),
                                   MDKR_AUDIO_EFFECTS_VOLUME, 100),
                       } });
     sTabs.push_back(
-        { "Game",
+        { L("Game", "Jogo", "Juego"),
           {
-              TextChoice("Opponent skill",
-                         "Original keeps the computer racers' own speed. Hard and Brutal make them faster. Takes "
-                         "effect after restarting the game.",
+              TextChoice(L("Opponent skill", "Dificuldade dos rivais", "Dificultad de los rivales"),
+                         L("Original keeps the computer racers' own speed. Hard and Brutal make them faster. Takes "
+                           "effect after restarting the game.",
+                           "Original mantém a velocidade dos rivais do computador. Difícil e Brutal os deixam mais "
+                           "rápidos. Vale depois de reiniciar o jogo.",
+                           "Original mantiene la velocidad de los rivales de la consola. Difícil y Brutal los hacen "
+                           "más rápidos. Se aplica al reiniciar el juego."),
                          MDKR_ENH_AI_DIFFICULTY,
-                         { { "original", "Original" }, { "hard", "Hard" }, { "brutal", "Brutal" } }),
-              TextChoice("Camera",
-                         "Original is the game's own camera. Avoid walls keeps it in front of walls and doors that "
-                         "would come between it and your racer. Takes effect at the next race.",
-                         MDKR_VIDEO_CAMERA_OBSTRUCTION, { { "observe", "Original" }, { "modern", "Avoid walls" } }),
-              NumberChoice("Adventure Party",
-                           "Lets two to four players explore Adventure mode together in split screen.",
-                           MDKR_ENH_ADVENTURE_PARTY, { { "0", "Off" }, { "1", "On" } }),
-              NumberChoice("Bonus racers",
-                           "Adds the bonus racers to the character select. Takes effect after restarting the game.",
-                           MDKR_CONTENT_BONUS_RACERS, { { "0", "Off" }, { "1", "On" } }),
+                         { { "original", original }, { "hard", L("Hard", "Difícil", "Difícil") },
+                           { "brutal", L("Brutal", "Brutal", "Brutal") } }),
+              TextChoice(L("Camera", "Câmera", "Cámara"),
+                         L("Original is the game's own camera. Avoid walls keeps it in front of walls and doors that "
+                           "would come between it and your racer. Takes effect at the next race.",
+                           "Original é a câmera do jogo. Desviar de paredes a mantém na frente de paredes e portas "
+                           "que ficariam entre ela e o seu corredor. Vale a partir da próxima corrida.",
+                           "Original es la cámara del juego. Evitar paredes la mantiene delante de paredes y puertas "
+                           "que quedarían entre ella y tu corredor. Se aplica desde la próxima carrera."),
+                         MDKR_VIDEO_CAMERA_OBSTRUCTION,
+                         { { "observe", original },
+                           { "modern", L("Avoid walls", "Desviar de paredes", "Evitar paredes") } }),
+              NumberChoice(L("Adventure Party", "Aventura em grupo", "Aventura en grupo"),
+                           L("Lets two to four players explore Adventure mode together in split screen.",
+                             "Deixa dois a quatro jogadores explorarem o modo Aventura juntos em tela dividida.",
+                             "Permite que de dos a cuatro jugadores exploren el modo Aventura juntos en pantalla "
+                             "dividida."),
+                           MDKR_ENH_ADVENTURE_PARTY, { { "0", off }, { "1", on } }),
+              NumberChoice(L("Bonus racers", "Corredores bônus", "Corredores extra"),
+                           L("Adds the bonus racers to the character select. Takes effect after restarting the game.",
+                             "Adiciona os corredores bônus à escolha de personagem. Vale depois de reiniciar o jogo.",
+                             "Añade los corredores extra a la selección de personaje. Se aplica al reiniciar el "
+                             "juego."),
+                           MDKR_CONTENT_BONUS_RACERS, { { "0", off }, { "1", on } }),
           } });
     sTabs.push_back(
-        { "Credits",
+        { L("Credits", "Créditos", "Créditos"),
           {
-              Info("Xbox 360 port", "Matherzin", "Diddy Kong Racing on the Xbox 360, ported by Matherzin."),
-              Info("PC port", "Golden Balloon by akratch",
-                   "The native PC port this one is built on (github.com/akratch/goldenballoon)."),
-              Info("Decompilation", "DavidSM64 and contributors",
-                   "The Diddy Kong Racing decompilation the PC port compiles (github.com/DavidSM64/Diddy-Kong-Racing)."),
-              Info("Toolchain", "xsdk", "The free Xbox 360 SDK that builds the game for the console."),
-              Info("Game", "Rare / Nintendo",
-                   "Diddy Kong Racing belongs to its owners. This port includes no game: use your own ROM."),
+              Info(L("Xbox 360 port", "Port para Xbox 360", "Port para Xbox 360"), "Matherzin",
+                   L("Diddy Kong Racing on the Xbox 360, ported by Matherzin.",
+                     "Diddy Kong Racing no Xbox 360, portado por Matherzin.",
+                     "Diddy Kong Racing en la Xbox 360, portado por Matherzin.")),
+              Info(L("PC port", "Port de PC", "Port de PC"), "Golden Balloon by akratch",
+                   L("The native PC port this one is built on (github.com/akratch/goldenballoon).",
+                     "O port nativo de PC em que este se baseia (github.com/akratch/goldenballoon).",
+                     "El port nativo de PC en el que se basa este (github.com/akratch/goldenballoon).")),
+              Info(L("Decompilation", "Decompilação", "Decompilación"), "DavidSM64 & contributors",
+                   L("The Diddy Kong Racing decompilation the PC port compiles (github.com/DavidSM64/Diddy-Kong-Racing).",
+                     "A decompilação do Diddy Kong Racing que o port de PC compila "
+                     "(github.com/DavidSM64/Diddy-Kong-Racing).",
+                     "La decompilación de Diddy Kong Racing que compila el port de PC "
+                     "(github.com/DavidSM64/Diddy-Kong-Racing).")),
+              Info(L("Toolchain", "Ferramentas", "Herramientas"), "xsdk",
+                   L("The free Xbox 360 SDK that builds the game for the console.",
+                     "O SDK livre de Xbox 360 que compila o jogo para o console.",
+                     "El SDK libre de Xbox 360 que compila el juego para la consola.")),
+              Info(L("Game", "Jogo", "Juego"), "Rare / Nintendo",
+                   L("Diddy Kong Racing belongs to its owners. This port includes no game: use your own ROM.",
+                     "Diddy Kong Racing pertence aos seus donos. Este port não inclui o jogo: use a sua ROM.",
+                     "Diddy Kong Racing pertenece a sus dueños. Este port no incluye el juego: usa tu ROM.")),
           } });
     return sTabs;
 }
@@ -332,6 +473,17 @@ std::string ValueText(const Item& item) {
             snprintf(buf, sizeof buf, "%d%%", (int)lroundf(Value(item.key).number));
             return buf;
         case K_INFO:
+            if (item.id == ID_RESTART) {
+                static const char* const kNames[3] = { "English", "Português (Brasil)", "Español" };
+                const int want = Lang();
+                const int have = dkr360_rom_language();
+                std::string v = kNames[have];
+                if (want != have) {
+                    v += dkr360_rom_available(want) ? L(" (restart: A)", " (reiniciar: A)", " (reiniciar: A)")
+                                                    : L(" (no ROM)", " (sem ROM)", " (sin ROM)");
+                }
+                return v;
+            }
             return item.info;
         case K_ACTION:
             return "";
@@ -530,9 +682,14 @@ class ConsoleMenu {
                 mConfirm = false;
                 if (mConfirmYes) {
                     Item& item = items[mRow];
-                    item.run();
-                    if (strcmp(item.label, "Restore defaults") == 0) {
-                        Toast("Options restored to their defaults");
+                    if (item.id == ID_RESTART) {
+                        dkr360_restart();
+                    } else {
+                        item.run();
+                    }
+                    if (item.id == ID_DEFAULTS) {
+                        Toast(L("Options restored to their defaults", "Opções restauradas para o padrão",
+                                "Opciones restauradas a sus valores"));
                     }
                 }
             } else if (pad.pressed & INPUT_GAMEPAD_B) {
@@ -562,6 +719,14 @@ class ConsoleMenu {
             mRow = (mRow + 1) % rows;
         }
         Item& item = now[mRow];
+        if (item.id == ID_RESTART) {
+            if ((pad.pressed & INPUT_GAMEPAD_A) && Lang() != dkr360_rom_language() &&
+                dkr360_rom_available(Lang())) {
+                mConfirm = true;
+                mConfirmYes = true;
+            }
+            return;
+        }
         if (item.kind == K_ACTION) {
             if (pad.pressed & INPUT_GAMEPAD_A) {
                 if (item.confirm) {
@@ -572,6 +737,7 @@ class ConsoleMenu {
                 }
             }
         } else if (item.kind != K_INFO) {
+            const bool language = item.id == ID_LANGUAGE;
             if (pad.left) {
                 Change(item, -1);
             } else if (pad.right) {
@@ -579,6 +745,7 @@ class ConsoleMenu {
             } else if (pad.pressed & INPUT_GAMEPAD_A) {
                 Change(item, 0);
             }
+            (void)language;
         }
     }
 
@@ -634,9 +801,9 @@ class ConsoleMenu {
                               Col(230, 40, 40, a));
         dl->AddLine(ImVec2(hx + 14, hy + 36), ImVec2(hx + 12, hy + 52), Col(240, 230, 210, 0.8f * a), 1.5f);
         Text(dl, 38.0f, ImVec2(hx + 40, hy - 2), Col(255, 220, 70, a), "DIDDY KONG RACING");
-        Text(dl, 20.0f, ImVec2(hx + 42, hy + 40), Col(235, 200, 150, a), "Xbox 360 options");
+        Text(dl, 20.0f, ImVec2(hx + 42, hy + 40), Col(235, 200, 150, a), L("Xbox 360 options", "Opções do Xbox 360", "Opciones de Xbox 360"));
         {
-            const char* by = "Port by Matherzin";
+            const char* by = L("Port by Matherzin", "Port por Matherzin", "Port por Matherzin");
             const ImVec2 bs = Measure(18.0f, by);
             Text(dl, 18.0f, ImVec2(p1.x - 36 - bs.x, hy + 44), Col(255, 190, 60, 0.9f * a), by);
         }
@@ -754,14 +921,14 @@ class ConsoleMenu {
         float hxp = p0.x + 40;
         const float hyp = p1.y - 38;
         ButtonGlyph(dl, ImVec2(hxp + 13, hyp), 13.0f, "A", Col(60, 170, 70, 1.0f), a);
-        hxp += 34 + Text(dl, 20.0f, ImVec2(hxp + 32, hyp - 12), Col(245, 232, 215, a), "Change") + 28;
+        hxp += 34 + Text(dl, 20.0f, ImVec2(hxp + 32, hyp - 12), Col(245, 232, 215, a), L("Change", "Mudar", "Cambiar")) + 28;
         ButtonGlyph(dl, ImVec2(hxp + 13, hyp), 13.0f, "B", Col(200, 50, 50, 1.0f), a);
-        hxp += 34 + Text(dl, 20.0f, ImVec2(hxp + 32, hyp - 12), Col(245, 232, 215, a), "Back") + 28;
+        hxp += 34 + Text(dl, 20.0f, ImVec2(hxp + 32, hyp - 12), Col(245, 232, 215, a), L("Back", "Voltar", "Volver")) + 28;
         ShoulderGlyph(dl, ImVec2(hxp + 22, hyp), "LB", a);
         ShoulderGlyph(dl, ImVec2(hxp + 70, hyp), "RB", a);
-        hxp += 100 + Text(dl, 20.0f, ImVec2(hxp + 98, hyp - 12), Col(245, 232, 215, a), "Tabs") + 28;
+        hxp += 100 + Text(dl, 20.0f, ImVec2(hxp + 98, hyp - 12), Col(245, 232, 215, a), L("Tabs", "Abas", "Pestañas")) + 28;
         ShoulderGlyph(dl, ImVec2(hxp + 34, hyp), "BACK", a);
-        Text(dl, 20.0f, ImVec2(hxp + 72, hyp - 12), Col(245, 232, 215, a), "Close");
+        Text(dl, 20.0f, ImVec2(hxp + 72, hyp - 12), Col(245, 232, 215, a), L("Close", "Fechar", "Cerrar"));
 
         if (mConfirm) {
             DrawConfirm(dl, a);
@@ -777,11 +944,14 @@ class ConsoleMenu {
         const char* title = Items()[mRow].label;
         const ImVec2 ts = Measure(26.0f, title);
         Text(dl, 26.0f, ImVec2(640 - ts.x * 0.5f, 296), Col(255, 220, 70, a), title);
-        const ImVec2 qs = Measure(22.0f, "Are you sure?");
-        Text(dl, 22.0f, ImVec2(640 - qs.x * 0.5f, 340), Col(245, 232, 215, a), "Are you sure?");
+        const char* question = Items()[mRow].id == ID_RESTART
+                                   ? L("Restart the game now?", "Reiniciar o jogo agora?", "¿Reiniciar el juego ahora?")
+                                   : L("Are you sure?", "Tem certeza?", "¿Seguro?");
+        const ImVec2 qs = Measure(22.0f, question);
+        Text(dl, 22.0f, ImVec2(640 - qs.x * 0.5f, 340), Col(245, 232, 215, a), question);
         for (int i = 0; i < 2; i++) {
             const bool yes = i == 0;
-            const char* s = yes ? "Yes" : "No";
+            const char* s = yes ? L("Yes", "Sim", "Sí") : L("No", "Não", "No");
             const ImVec2 b0(yes ? 500 : 660, 390), b1(yes ? 620 : 780, 430);
             const bool sel = yes == mConfirmYes;
             dl->AddRectFilled(b0, b1, sel ? Col(220, 120, 30, a) : Col(80, 52, 30, a), 10.0f);
@@ -919,6 +1089,22 @@ void dkr360_menu_render(void) {
         Init();
     }
     FirstRunDefaults();
+    {
+        // A run nobody holds a pad in (Xenia): with game:\dkr360_test_restart.txt the menu's restart runs once, at
+        // frame 300, the file removed first.
+        static unsigned sFrames;
+        if (++sFrames == 300) {
+            if (FILE* f = fopen("dkr360_test_restart.txt", "r")) {
+                fclose(f);
+                remove("dkr360_test_restart.txt");
+                dkr360_restart();
+            }
+        }
+    }
+    if (sRebuildTabs) {
+        sRebuildTabs = false;
+        sTabs.clear();
+    }
     const auto now = std::chrono::steady_clock::now();
     float dt = sLast.time_since_epoch().count() == 0 ? 1.0f / 60.0f
                                                      : std::chrono::duration<float>(now - sLast).count();

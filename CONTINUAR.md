@@ -90,6 +90,40 @@ master 85% (a mix satura a 100%). Cuidado: variáveis `MDKR_*` de ambiente **tra
    `DKR_AUDIO_DEVICE_PERIOD` se estalar).
 5. Rumble, saves no HDD/USB, sair pelo menu.
 
+## Teste 2 (depois do primeiro teste no console)
+
+O usuário confirmou no console: roda bem, sem problemas visuais, mas o FPS cai até 20 em certos momentos.
+
+**Desempenho** (perfil em `dkr360_prof.c`, linha `prof:` a cada 5 s; slots aninhados explicados no `.h`). No Xenia,
+o walk do HLE (+ o replay da interpolação, outro walk inteiro) era ~380 ms/s na cena mais pesada; G_TRIN dominava.
+Mudanças (todas `__XSDK__`):
+- cache de texturas: tabela de dicas na frente da busca linear de 1024 entradas (bind 52→15 ms/s);
+- combinador: último lookup memorizado e features decodificadas só quando os ids mudam;
+- `DKR360_ORIGINAL`: o walk real não procura mais nas dependências retidas (só o replay lê cópias);
+- triângulos agrupados entre G_TRINs (o GB dava flush no fim de cada um); flush antes de troca de textura/sampler e
+  em todo miss do cache (`dkr_bind_tile`); o resto do estado já fazia flush ao mudar;
+- caminho rápido sem cópias de `LoadedVertex` para triângulo sem clipping;
+- `c / 255.0f` por tabela (int→float é load-hit-store no Xenon, invisível no Xenia);
+- posição no mundo e normal suave por vértice só com Remaster FX;
+- backend: vértices para a GPU com o `memcpy` VMX do xsdk; `-O3`; **3 front buffers** (antes 2: pacer do GB +
+  espera de vblank podiam somar e virar 33/50 ms; suspeita forte para o "cai até 20", que o Xenia sem display não
+  mostra). Log novo `xenos: display ... missed ... longest buffer wait`.
+Resultado no Xenia: ~380→~260 ms/s na cena pesada, imagem idêntica (1P e 4P). **Falta o log do console** para ver o
+efeito real e o que sobra. Próximo passo grande se precisar: thread de render (o N64 já roda RSP em paralelo à CPU e o
+DKR usa buffers duplos para isso; o desafio são os registros que o código do jogo faz durante a montagem da lista e a
+máquina de replay da interpolação).
+
+**Idiomas**: menu em EN/PT/ES (`L(en, pt, es)`; as abas são reconstruídas ao trocar). Geral > Idioma (primeiro item:
+Automático/English/Português (Brasil)/Español, salvo em `dkr360\console.ini` `Language=`). O cartucho US só tem
+inglês/francês; PT/ES vêm de ROMs traduzidas `dkr_pt.z64`/`dkr_es.z64` ao lado do `.xex`
+(`make-game-data.sh <rom> <pasta> pt|es`). `dkr360_main.c` escolhe a ROM no boot; "Textos do jogo" mostra a ROM
+carregada e A reinicia (`xsdk_launch` do próprio `.xex`). Testado no Xenia: escolha da ROM e saída com
+`launching game:\dkr360.xex` (o Xenia não reabre; reinício só confirmável no console). **As ROMs traduzidas ainda não
+foram testadas** (o usuário ia mandar): conferir se o Golden Balloon aceita (CRC diferente → aviso, não recusa;
+tamanho/LUT podem mudar se a tradução expandiu a ROM).
+
+Ganchos de teste novos: `dkr360_test_restart.txt` (reinicia no quadro 300).
+
 ## Próximos passos sugeridos
 
 - Thread de render separada se o console ficar abaixo de 60.

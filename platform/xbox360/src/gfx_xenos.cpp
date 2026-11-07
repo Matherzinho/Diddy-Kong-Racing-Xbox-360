@@ -31,7 +31,8 @@ extern "C" {
 #include "gfx_rendering_api.h"
 }
 
-#include "dkr360_shaders.h" // fast3d.vert, fast3d_v0..255.frag, ui.vert, ui.frag
+#include "dkr360_shaders.h"
+#include "dkr360_prof.h" // fast3d.vert, fast3d_v0..255.frag, ui.vert, ui.frag
 
 extern "C" void Oot360_LogMemory(const char* where);
 extern "C" void Oot360_Phase(const char* phase);
@@ -717,6 +718,7 @@ bool XenosUploadTexture(const uint8_t* rgba, int width, int height) {
     if (width <= 0 || height <= 0) {
         return false;
     }
+    DKR360_PROF_BEGIN(tex);
     XenosTexture& t = Texture(X.currentTextureIds[X.currentTile]);
     // Bytes red, green, blue, alpha: as a big-endian word, R8G8B8A8.
     if (!CreateTextureStorage(t, XSDK_FORMAT_R8G8B8A8, (uint32_t)width, (uint32_t)height)) {
@@ -724,6 +726,7 @@ bool XenosUploadTexture(const uint8_t* rgba, int width, int height) {
     }
     xsdk_texture_upload(&t.texture, 0, rgba, (uint32_t)width * 4);
     xsdk_gpu_invalidate(t.texture.address, t.texture.size_bytes);
+    DKR360_PROF_END(tex, DKR360_PROF_TEXTURE);
     return true;
 }
 
@@ -914,7 +917,7 @@ void XenosDrawTriangles(float vbo[], size_t vboLen, size_t numTris) {
     if (!mem) {
         return;
     }
-    WriteWords(mem, vbo, bytes);
+    memcpy((void*)mem, vbo, bytes); // xsdk memcpy: VMX, in-order stores, safe for write-combined memory
     xsdk_gpu_invalidate(address, bytes);
     xsdk_gpu_set_vertices(0, address, bytes);
     if (vboLen != (size_t)prg->numFloats * 3 * numTris) {
@@ -1054,6 +1057,18 @@ void LogFrameStats() {
                    (unsigned long long)X.frame, rate, (unsigned long long)X.drawsThisFrame,
                    (unsigned)X.shaderPool.size(), (unsigned)X.vertexShaders.size(), (unsigned)X.pools.size(),
                    (unsigned)X.overflows, (unsigned)(X.textures.size() - X.freeTextureIds.size()));
+    if (!X.headless) {
+        // The display's side (console only): vblanks with no new frame, flips that ran late, the longest wait for a
+        // front buffer, over the last 600 frames.
+        static XsdkPresentStats sLast;
+        XsdkPresentStats ps = {};
+        xsdk_present_stats(&ps);
+        xsdk_log_write("xenos: display %u vblanks, %u flips, %u missed, %u late, longest buffer wait %u us",
+                       (unsigned)(ps.vblanks - sLast.vblanks), (unsigned)(ps.flips - sLast.flips),
+                       (unsigned)(ps.missed - sLast.missed), (unsigned)(ps.late - sLast.late),
+                       (unsigned)ps.longest_wait_us);
+        sLast = ps;
+    }
     X.lastLogTime = now;
     X.lastLogFrame = X.frame;
 }
@@ -1127,9 +1142,14 @@ void XenosEndFrame(void) {
         return;
     }
     // The console's own menu over the game's picture.
-    dkr360_menu_render();
+    {
+        DKR360_PROF_BEGIN(menu);
+        dkr360_menu_render();
+        DKR360_PROF_END(menu, DKR360_PROF_MENU);
+    }
     ResetDrawState();
     CaptureIfAsked();
+    DKR360_PROF_BEGIN(gpu);
     uint32_t address = 0;
     Oot360_Phase("xenos: present wait");
     if (X.headless) {
@@ -1153,9 +1173,11 @@ void XenosEndFrame(void) {
         xsdk_gpu_wait(X.frameFence[X.ringIndex], kFenceTimeoutMs);
     }
     Oot360_Phase("xenos: frame end");
+    DKR360_PROF_END(gpu, DKR360_PROF_GPUWAIT);
     X.vertexOffset = 0;
     GpuReclaim();
     LogFrameStats();
+    dkr360_prof_frame();
 }
 
 void XenosFinishRender(void) {
@@ -1220,7 +1242,7 @@ int dkr360_video_init(int* width, int* height) {
         return -1;
     }
     uint32_t w = 1280, h = 720;
-    s = xsdk_present_open(XSDK_DISPLAY_720P, 2, 1, &w, &h);
+    s = xsdk_present_open(XSDK_DISPLAY_720P, 3, 1, &w, &h);
     if (!NT_SUCCESS(s)) {
         xsdk_log_write("xenos: xsdk_present_open failed: 0x%08X; going on without a display (Xenia?)", (unsigned)s);
         X.headless = true;
@@ -1299,7 +1321,7 @@ void dkr360_ui_draw(uint32_t textureId, const void* vertices, uint32_t vertexCou
     if (!vmem) {
         return;
     }
-    WriteWords(vmem, vertices, vbytes);
+    memcpy((void*)vmem, vertices, vbytes);
     xsdk_gpu_invalidate(vaddr, vbytes);
     const uint32_t ibytes = (indexCount * 2 + 3) & ~3u;
     uint32_t iaddr;

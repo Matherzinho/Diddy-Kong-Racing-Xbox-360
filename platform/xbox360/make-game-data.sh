@@ -45,6 +45,11 @@ print(f"ROM: {title}, {region} 1.{revision}, {len(data) >> 20} MB, sha1 {sha1}" 
       (f" = {known[sha1]}" if sha1 in known else ""))
 if code[3:4] == "J":
     print("warning: the Japanese ROM is the least tested one in Golden Balloon")
+if len(data) > 0xC00000 and len(data) < 0x1000000 and sys.argv[3] != "":
+    # a translation that grew past 12 MB (the PT-BR one is 14.3 MB): pad with 0xFF to 16 MB; the asset table of
+    # these ROMs ends past their last byte, and Golden Balloon takes 12 MB or 16 MB images only
+    data += b"\xff" * (0x1000000 - len(data))
+    print("padded to 16 MB")
 open(sys.argv[2], "wb").write(data)
 EOF
 python3 -I "$TMP/convert.py" "$ROM" "$OUT/$NAME" "${3:-}"

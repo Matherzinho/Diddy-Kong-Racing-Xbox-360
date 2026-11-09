@@ -147,3 +147,72 @@ Gancho de teste: `dkr360_menu_open.txt` = "aba [idioma [1]]" (idioma 0-3, 1 = ap
 - Thread de render separada se o console ficar abaixo de 60.
 - Mapear Back+Start para sair, como nos outros ports.
 - Testar Adventure (hub, Taj, chefes) e todas as pistas; a ROM 1.0 só foi testada no caminho Time Trial/Tracks.
+
+
+## Teste 4 — português (PT-BR) funcionando
+
+ROM PT-BR = a tradução Dream64 "V1.0 Rev 7" aplicada sobre a USA 1.0 (sha1 do resultado `ec14eece...`, 14,3 MB, cabeçalho
+"DKR BR V1.0 - Rev7"). `tools/vcdiff_apply.py <rom 1.0.z64> <patch.xdelta> <saida>` aplica o xdelta sem precisar do
+xdelta3 (confere o adler32 de cada janela). O usuário já tem o resultado em `E:\Roms - Isos\Nintendo 64\Diddy Kong Racing (PT-BR).z64`.
+`make-game-data.sh <rom pt> <pasta> pt` agora completa com 0xFF até 16 MB.
+
+Por que o espanhol só traduzia parte e o português traduz tudo: o Golden Balloon roda o **código C da decompilação**, não o
+código da ROM; só os *assets* (textos de diálogo/menu, fontes, texturas) vêm da ROM. A ROM ES (Rev 1 + carlosxpx2) só mexe
+nos diálogos. A PT-BR mexe também nas texturas de menu, na fonte (acentos) e no asset de nomes de pistas.
+
+O que o patch do GB ganhou para a PT-BR (todas as mudanças são só para ROM traduzida/estendida):
+- `rom_validation.[ch]`, `rom_io.c`: aceitam 12 MB **ou 16 MB**; imagem de 16 MB tem `romEnd = tamanho` (a tabela de assets da
+  PT-BR cresce: texturas 3D/2D e fontes; a última entrada da LUT aponta além do arquivo).
+- `game.c`: a tabela de nomes de pistas da PT-BR só tem 1 idioma por pista e entradas finais velhas (2785, 3387 > 1152):
+  as entradas são limitadas ao tamanho da seção e blocos vazios reaproveitam o nome anterior.
+- `rom_io.c`: `gMdkrPtBr` (título "DKR BR"), `mdkr_pt_text()`: a ROM PT-BR troca por código textos que o C do jogo tem
+  literais (créditos, 1º..8º, "NÃO PODE SALVAR FANTASMA", CORRIDA/VOLTA...). Aplicada em `render_text_string` e
+  `get_text_width` (font.c). Os acentos são a codificação própria da tradução (`$`=ç, `@`+letra = til, `)` `(` `<` `&` `*`).
+- Verificado no Xenia: título (INICIAR JOGO / OPÇÕES), "ESCOLHA O JOGADOR", aviso do Rumble Pak, seleção de pista/veículo
+  (LAGO ANTIGO, MEL.TEMPO, CARRO/HOVER/AVIÃO), HUD (VOLTA 1/3, TEMPO). Não verificado: créditos, tela de resultados
+  (1º..), "NÃO PODE SALVAR FANTASMA", diálogos (Taj, Tricky...), Adventure inteiro, textos "VIDEO OPTIONS" do próprio GB.
+- Não portado: o scroller "EQUIPE DREAM 64" e a tela "Intro64" (rodam no código da ROM, não existem no GB).
+
+Teste: `tools/runtest.ps1 -Seconds 130` copia o .xex do WSL para `xenia-teste`, roda o Xenia e mostra o log;
+`tools/ppm2png.py xenia-teste work/shots` converte as capturas.
+
+### Desempenho (log do console, ROM ES, teste 3)
+Cena pesada (pista, 5 s): walk 100–140 ms/s, replay 126–162, copy da arena 70–100, audio 65–90 (thread 4), jogo ~80–160;
+60 fps na maior parte, mas 37–39 vblanks perdidos a cada 600 na pior cena e travadas de 145–660 ms (carregamento de pista).
+Draw distance já está em 100% (original). Nada foi mudado no desempenho no teste 4. O ganho que falta é o grande:
+**thread de render** — `sched_dispatch_task` (stubs_dkr.c) roda gfx_start_frame/gfx_run/gfx_end_frame inline na thread do
+jogo; no N64 o RSP corria em paralelo e o DKR já usa lista/vértices/matrizes duplicados. Plano: copiar a arena para o
+replay no momento do envio (thread do jogo), mandar o walk + replays + present para uma thread no hardware thread 1/3 e
+sinalizar `s_gfxDone` ao fim; cuidar de todo estado global do renderizador (só a thread de render pode tocá-lo) e do pacer.
+
+
+## Teste 5 — cópia da arena fora do caminho crítico
+
+Análise do pacer (stubs_dkr.c, `osRecvMesg` da fila de vídeo): por tick de 30 Hz a thread do jogo faz lógica -> walk
+autoritativo -> cópia da arena -> present do endpoint (que precisa sair no vblank do tick) e só depois, na outra metade,
+o replay a alfa 1/2 e seu present. O vblank perdido é o tick cuja soma lógica+walk+cópia passa de ~16,7 ms; o replay e a
+espera ficam folgados. Por isso uma thread de render completa **não** foi feita: o replay (câmeras interpoladas, task
+retida, `present_sched_*`) e o pacer usam estado do jogo/renderizador de forma entrelaçada e a lógica do próximo tick só
+começa no vencimento do tick; tirar o walk da thread do jogo só ajuda se o present/replay inteiro migrar junto, o que muda
+o pacer de ~7000 linhas sem console para validar. Ficou o que dá para provar:
+- `gfx_retained_task.c`: a cópia da arena para o replay vai para uma thread auxiliar (hardware thread 1) disparada em
+  `capture_begin` (início do walk, que só lê a arena) e junta em `capture_commit`; se o pool cresceu durante o walk, o
+  resto copia inline. Slot `copy` e `endframe` no log caem a ~0 na thread do jogo.
+- Xenia (1P, mesma rota/autopilot, quadros 5000/6000/7000 byte a byte idênticos ao teste 4): `endframe` 15–19 -> 1,5–1,9 ms/s,
+  `copy` 13–18 -> 0,0; walk/replay iguais. 4P tela dividida roda estável, imagem correta. No console a cópia custava
+  70–100 ms/s (log do teste 3), ou seja ~3 ms a menos por tick no caminho do endpoint.
+- Falta medir no console (`prof:` e `missed` do dkr360.log). Se ainda perder vblanks: próximo passo é encurtar o walk
+  (VMX no G_VTX/G_TRIN) ou mover o present/replay inteiro + o pacer para uma thread (tarefa grande).
+- `tools/runtest.ps1 -Xex <caminho> -Filter "prof:"` roda o Xenia com outro .xex e filtra o log.
+
+
+## Teste 6 — endpoint lead no pacer
+
+Log do console (teste 5, hub do Adventure, level 0): `copy` 0 e `endframe` ~10 (a cópia em thread auxiliar funcionou), mas
+walk 200–270 ms/s, replay 200–285, jogo 130–220; janelas com 20–30 (até 86) vblanks perdidos em 600 (~57 fps); corridas
+normais 0 perdidos. Janela de compute do tick = 1 vblank (16,7 ms). `platform_sdl_min.c`: o "endpoint lead" do WebGPU agora
+existe também no xsdk (`s_xsdkEndpointSlotNs`): o wake que torna o tick devido roda `lead` (padrão 7 ms,
+`MDKR_PRESENT_ENDPOINT_LEAD_US` / arquivo `dkr360_lead.txt`, 0–12000) antes, o relógio ganha o crédito (`now += lead`) e
+`platform_present_endpoint_gate` segura a imagem até o slot. Log `lead:` a cada 300 ticks mostra quantos estouraram o lead.
+Xenia: 60 fps, quadro de corrida igual (tempo de corrida ±0,1 s). Não medido no console.
+Se o hub ainda perder vblanks: diminuir walk/replay (VMX no G_VTX/G_TRIN; replay compartilhando cálculo do walk).

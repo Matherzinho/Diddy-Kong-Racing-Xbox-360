@@ -103,6 +103,23 @@ static void *GameThread(void *arg) {
 	}
 	/* Test runs where nobody holds a pad (Xenia): Golden Balloon's own input script, a line "frame BUTTONS [hold]
 	 * [P1-P4]" each (tests/input_scripts/), and its autopilot, which drives the racing line. */
+	/* A file dkr360_lead.txt (a number of microseconds, 0-12000; 0 turns it off) overrides how early the tick that is due is
+	 * computed before its display slot (the present pacing's endpoint lead, platform_sdl_min.c; the default is 7000). */
+	if (FileExists("dkr360_lead.txt")) {
+		FILE *f = fopen("dkr360_lead.txt", "r");
+		char buf[16] = { 0 };
+		if (f != NULL) {
+			if (fgets(buf, sizeof buf, f) != NULL) {
+				unsigned long v = strtoul(buf, NULL, 10);
+				if (v <= 12000ul) {
+					snprintf(buf, sizeof buf, "%lu", v);
+					setenv("MDKR_PRESENT_ENDPOINT_LEAD_US", buf, 1);
+					xsdk_log_write("dkr360: endpoint lead %lu us (dkr360_lead.txt)", v);
+				}
+			}
+			fclose(f);
+		}
+	}
 	if (FileExists("dkr360_autopad.txt")) {
 		argv[argc++] = "--input-script";
 		argv[argc++] = "dkr360_autopad.txt";

@@ -31,6 +31,70 @@ index d6494261..f86b5d59 100644
  #endif
          alCSeqNew(seq, sequence);
          alCSPSetSeq(seqp, seq);
+diff --git a/game/src/font.c b/game/src/font.c
+index eea514f6..5d5ddc0f 100644
+--- a/game/src/font.c
++++ b/game/src/font.c
+@@ -457,8 +457,14 @@ UNUSED void draw_dialogue_text_pos_unused(Gfx **displayList, s32 dialogueBoxID,
+  * Will also draw a fillrect if text backgrounds are enabled.
+  */
+ #if REGION != REGION_JP
++#ifdef NATIVE_PORT
++extern const char *mdkr_pt_text(const char *text);
++#endif
+ void render_text_string(Gfx **dList, DialogueBoxBackground *box, char *text, AlignmentFlags alignmentFlags,
+                         f32 scisScale) {
++#ifdef NATIVE_PORT
++    text = (char *) mdkr_pt_text(text);
++#endif
+     s32 scisOffset;
+     s32 scisPos;
+     s32 ypos;
+@@ -815,6 +821,9 @@ s32 get_text_width(char *text, s32 x, s32 font) {
+     s32 index;
+     u8 ch;
+ 
++#ifdef NATIVE_PORT
++    text = (char *) mdkr_pt_text(text);
++#endif
+     if (text == NULL) {
+         return 0;
+     }
+diff --git a/game/src/game.c b/game/src/game.c
+index c5c02fa4..fd1a6610 100644
+--- a/game/src/game.c
++++ b/game/src/game.c
+@@ -271,6 +271,17 @@ void level_global_init(void) {
+     for (i = 0; gTempAssetTable[i] != (-1); i++) {}
+     i--;
+ #ifdef NATIVE_PORT
++    {
++        /* Translated ROMs (PT-BR) keep stale end offsets for the level-name blocks they shrank to one language:
++         * clamp them to the section so the span checks below see a consistent table. */
++        u32 nameLimit = (u32) asset_table_size(ASSET_LEVEL_NAMES);
++        s32 clampIndex;
++        for (clampIndex = 0; clampIndex <= i; clampIndex++) {
++            if (gTempAssetTable[clampIndex] > (s32) nameLimit) {
++                gTempAssetTable[clampIndex] = (s32) nameLimit;
++            }
++        }
++    }
+     if (i < gNumberOfLevelHeaders || i <= 0 ||
+         (size_t)i > INT32_MAX / (sizeof(void *) + sizeof(u32)) ||
+         gTempAssetTable[i] <= 0 || gTempAssetTable[i] > asset_table_size(ASSET_LEVEL_NAMES)) {
+@@ -300,6 +311,12 @@ void level_global_init(void) {
+ #endif
+     for (size = 0; size < i; size++) {
+ #ifdef NATIVE_PORT
++        if (size > 0 && gTempAssetTable[size + 1] <= gTempAssetTable[size]) {
++            /* empty (clamped) name block of a translated ROM: reuse the previous level name */
++            gLevelNames[size] = gLevelNames[size - 1];
++            sLevelNameSizes[size] = sLevelNameSizes[size - 1];
++            continue;
++        }
+         if (!mdkr_asset_rows_fit(gTempAssetTable[size], gTempAssetTable[size + 1], 1, 1) ||
+             gTempAssetTable[size + 1] > gTempAssetTable[i]) {
+             fprintf(stderr, "[FATAL] level name span invalid: index=%d\n", size);
 diff --git a/game/src/game_text.c b/game/src/game_text.c
 index d0583905..11014cff 100644
 --- a/game/src/game_text.c
@@ -1014,10 +1078,124 @@ index 7c42adea..9019f874 100644
  
  void gfx_dkr_replay_invalidate(void) {
 diff --git a/platform/fast3d/gfx_retained_task.c b/platform/fast3d/gfx_retained_task.c
-index 17cf8b9a..246ebd87 100644
+index 17cf8b9a..dcf442be 100644
 --- a/platform/fast3d/gfx_retained_task.c
 +++ b/platform/fast3d/gfx_retained_task.c
-@@ -301,7 +301,41 @@ bool gfx_retained_task_capture_commit(
+@@ -6,6 +6,81 @@
+ #include <stdlib.h>
+ #include <string.h>
+ 
++#ifdef __XSDK__
++#include <pthread.h>
++/* dkr360: the arena copy for the replays (3-4 ms an authored frame on the Xbox 360) runs on a helper thread beside the
++ * real walk, which only reads the arena: it starts at capture_begin and is joined at capture_commit. */
++static pthread_mutex_t s_cp_mutex = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t s_cp_cond = PTHREAD_COND_INITIALIZER;
++static int s_cp_state;            /* 0 idle, 1 asked, 2 done */
++static int s_cp_started;          /* the thread exists */
++static int s_cp_failed;           /* it could not be made: copy inline */
++static void *s_cp_dst;
++static const void *s_cp_src;
++static size_t s_cp_len;
++static int s_cp_inflight;         /* a copy was asked for this capture */
++static size_t s_cp_used;          /* bytes it covers */
++
++static void *copy_thread_main(void *arg) {
++    extern long xsdk_thread_move(unsigned hardware_thread);
++    (void)arg;
++    (void)xsdk_thread_move(1);
++    pthread_mutex_lock(&s_cp_mutex);
++    for (;;) {
++        while (s_cp_state != 1) {
++            pthread_cond_wait(&s_cp_cond, &s_cp_mutex);
++        }
++        pthread_mutex_unlock(&s_cp_mutex);
++        memcpy(s_cp_dst, s_cp_src, s_cp_len);
++        pthread_mutex_lock(&s_cp_mutex);
++        s_cp_state = 2;
++        pthread_cond_broadcast(&s_cp_cond);
++    }
++    return NULL;
++}
++
++static void copy_join(void) {
++    if (!s_cp_started || s_cp_state == 0) {
++        return;
++    }
++    pthread_mutex_lock(&s_cp_mutex);
++    while (s_cp_state == 1) {
++        pthread_cond_wait(&s_cp_cond, &s_cp_mutex);
++    }
++    s_cp_state = 0;
++    pthread_mutex_unlock(&s_cp_mutex);
++}
++
++/* 1 when the copy was handed to the helper thread. */
++static int copy_start(void *dst, const void *src, size_t len) {
++    if (s_cp_failed) {
++        return 0;
++    }
++    if (!s_cp_started) {
++        pthread_attr_t attr;
++        pthread_t thread;
++        pthread_attr_init(&attr);
++        pthread_attr_setstacksize(&attr, 256u << 10);
++        if (pthread_create(&thread, &attr, copy_thread_main, NULL) != 0) {
++            s_cp_failed = 1;
++            pthread_attr_destroy(&attr);
++            return 0;
++        }
++        pthread_attr_destroy(&attr);
++        s_cp_started = 1;
++    }
++    copy_join();
++    pthread_mutex_lock(&s_cp_mutex);
++    s_cp_dst = dst;
++    s_cp_src = src;
++    s_cp_len = len;
++    s_cp_state = 1;
++    pthread_cond_broadcast(&s_cp_cond);
++    pthread_mutex_unlock(&s_cp_mutex);
++    return 1;
++}
++#endif
++
+ #define RETAINED_EXTERNAL_INITIAL 16u
+ #define RETAINED_EXTERNAL_MAX 16384u
+ #define RETAINED_EXTERNAL_BYTES_MAX (64u * 1024u * 1024u)
+@@ -241,6 +316,31 @@ bool gfx_retained_task_capture_begin(uint64_t authored_tick,
+     }
+     s_stats.capture_begins++;
+     s_stats.arena_copy_budget = budget;
++#ifdef __XSDK__
++    {
++        extern size_t mdkr_mempool_main_used_bytes(void);
++        /* an earlier capture that never committed may still be copying into the spare */
++        copy_join();
++        s_cp_inflight = 0;
++        if (s_capture.active) {
++            size_t used = mdkr_mempool_main_used_bytes();
++            if (used == 0u || used > s_capture.arena_size - 4096u) {
++                used = s_capture.arena_size;
++            } else {
++                used = (used + 4095u) & ~(size_t)4095u;
++            }
++            if (s_spare_arena_size < s_capture.arena_size) {
++                free(s_spare_arena);
++                s_spare_arena = (uint8_t *)malloc(s_capture.arena_size);
++                s_spare_arena_size = s_spare_arena != NULL ? s_capture.arena_size : 0u;
++            }
++            if (s_spare_arena != NULL && copy_start(s_spare_arena, s_capture.arena, used)) {
++                s_cp_inflight = 1;
++                s_cp_used = used;
++            }
++        }
++    }
++#endif
+     return s_capture.active;
+ }
+ 
+@@ -301,7 +401,50 @@ bool gfx_retained_task_capture_commit(
          return false;
      }
      next.arena = capture_arena;
@@ -1040,7 +1218,16 @@ index 17cf8b9a..246ebd87 100644
 +            __asm__ volatile("mftbu %0" : "=r"(hi));
 +            __asm__ volatile("mftb %0" : "=r"(lo));
 +            const unsigned long long t0 = ((unsigned long long)hi << 32) | lo;
-+            memcpy(next.arena, s_capture.arena, used);
++            if (s_cp_inflight && next.arena == s_spare_arena) {
++                copy_join();
++                if (used > s_cp_used) { /* the pool grew during the walk: the rest, inline */
++                    memcpy(next.arena + s_cp_used, s_capture.arena + s_cp_used, used - s_cp_used);
++                }
++            } else {
++                copy_join();
++                memcpy(next.arena, s_capture.arena, used);
++            }
++            s_cp_inflight = 0;
 +            __asm__ volatile("mftbu %0" : "=r"(hi));
 +            __asm__ volatile("mftb %0" : "=r"(lo));
 +            dkr360_prof_add(9 + 5 + 0, (((unsigned long long)hi << 32) | lo) - t0);
@@ -1140,7 +1327,7 @@ index 3749180c..28b416d9 100644
  #error "online OS tag unmapped for this platform: prove its gameplay \
  determinism domain and add it here (and to the pinned unit vectors) before \
 diff --git a/platform/platform_sdl_min.c b/platform/platform_sdl_min.c
-index 952ac542..b409414b 100644
+index 952ac542..3490e11f 100644
 --- a/platform/platform_sdl_min.c
 +++ b/platform/platform_sdl_min.c
 @@ -35,6 +35,13 @@
@@ -1355,6 +1542,219 @@ index 952ac542..b409414b 100644
      if (wait_start != 0u) {
          gfx_dkr_wait_note_pace(
              wait_start, target_ns > entry ? target_ns - entry : 0u,
+@@ -5609,7 +5730,65 @@ int platform_present_slot_alpha_active(void) {
+ #endif
+ }
+ 
++#ifdef __XSDK__
++/* dkr360: the endpoint lead of the WebGPU present discipline, for the Xbox 360's capped 60 fps pacing. The tick that is
++ * due at a wake is computed LEAD early (the sim clock is credited the lead, so ticks come at the same wall rate) and
++ * the finished image is held back to the slot the unled wake would have used (platform_present_endpoint_gate), so the
++ * compute of the heavy scenes has 16.7 ms + LEAD before the vblank instead of 16.7 ms. */
++static uint64_t s_xsdkEndpointSlotNs;
++static uint64_t s_xsdkLeadNs;
++static uint64_t s_xsdkLeads, s_xsdkLeadOver, s_xsdkLeadOverMaxNs, s_xsdkLeadOverTotalNs;
++
++static uint64_t xsdk_endpoint_lead_ns(void) {
++    static int64_t cached = -1;
++    if (cached < 0) {
++        const char *value = getenv("MDKR_PRESENT_ENDPOINT_LEAD_US");
++        unsigned long parsed = 7000ul;
++        if (value != NULL && value[0] != '\0') {
++            char *end = NULL;
++            const unsigned long p = strtoul(value, &end, 10);
++            if (end != NULL && *end == '\0' && p <= 12000ul) {
++                parsed = p;
++            }
++        }
++        cached = (int64_t)parsed * 1000;
++    }
++    return (uint64_t)cached;
++}
++#endif
++
+ void platform_present_endpoint_gate(void) {
++#ifdef __XSDK__
++    {
++        const uint64_t slot_ns = s_xsdkEndpointSlotNs;
++        s_xsdkEndpointSlotNs = 0u;
++        if (slot_ns != 0u) {
++            extern void xsdk_log_write(const char *format, ...);
++            const uint64_t now = pace_host_ns();
++            s_xsdkLeads++;
++            if (now < slot_ns) {
++                (void)pace_sleep_until(slot_ns);
++            } else {
++                const uint64_t over = now - slot_ns;
++                s_xsdkLeadOver++;
++                s_xsdkLeadOverTotalNs += over;
++                if (over > s_xsdkLeadOverMaxNs) {
++                    s_xsdkLeadOverMaxNs = over;
++                }
++            }
++            if (s_xsdkLeads % 300u == 0u) {
++                xsdk_log_write("lead: %u ticks, %u overran the %u us lead (mean %u us, worst %u us)",
++                               (unsigned)s_xsdkLeads, (unsigned)s_xsdkLeadOver,
++                               (unsigned)(s_xsdkLeadNs / 1000u),
++                               (unsigned)(s_xsdkLeadOver != 0u ? s_xsdkLeadOverTotalNs / s_xsdkLeadOver / 1000u : 0u),
++                               (unsigned)(s_xsdkLeadOverMaxNs / 1000u));
++                s_xsdkLeads = s_xsdkLeadOver = 0u;
++                s_xsdkLeadOverTotalNs = s_xsdkLeadOverMaxNs = 0u;
++            }
++        }
++        return;
++    }
++#endif
+ #if defined(MDKR_WEBGPU_BACKEND) && !defined(__EMSCRIPTEN__)
+     uint64_t slot_ns;
+     uint64_t now;
+@@ -6177,6 +6356,23 @@ uint64_t platform_vi_present_pace_units(void) {
+             }
+         }
+ #endif
++#ifdef __XSDK__
++        s_xsdkEndpointSlotNs = 0u;
++        s_xsdkLeadNs = 0u;
++        if (deadline && clock == &s_presentDeadline && s_presentEffectiveRate != 0u &&
++            !present_sched_render_elided()) {
++            const uint64_t lead_ns = xsdk_endpoint_lead_ns();
++            const uint64_t quantum_units =
++                (uint64_t)s_fieldHz * UINT64_C(1000000000) / (uint64_t)s_presentEffectiveRate;
++            const uint64_t to_tick = present_sched_units_to_tick();
++            /* only the wake that makes the tick due, and only when it still would be with the lead credited */
++            if (lead_ns != 0u && target > now + lead_ns && to_tick != 0u && to_tick <= quantum_units) {
++                s_xsdkEndpointSlotNs = target;
++                s_xsdkLeadNs = lead_ns;
++                target -= lead_ns;
++            }
++        }
++#endif
+ #ifdef __EMSCRIPTEN__
+         /* Browser presentation is at most one opportunity per rAF. Numeric
+          * caps skip rAF opportunities until their absolute deadline; display
+@@ -6188,6 +6384,12 @@ uint64_t platform_vi_present_pace_units(void) {
+         if (deadline && now < target) {
+             now = pace_sleep_until(target);
+         }
++#endif
++#ifdef __XSDK__
++        if (s_xsdkLeadNs != 0u) {
++            /* the sim and the grid see the wake as the slot it stands for */
++            now += s_xsdkLeadNs;
++        }
+ #endif
+         if (now > s_presentLastNs &&
+             mdkr_pacing_interval_requires_rebase(
+diff --git a/platform/rom_io.c b/platform/rom_io.c
+index 17dd7b50..1dedba31 100644
+--- a/platform/rom_io.c
++++ b/platform/rom_io.c
+@@ -29,6 +29,7 @@
+ #include "rom_id.h"
+ #include "rom_validation.h"
+ #include "address_domains.h"
++extern int gMdkrPtBr;
+ 
+ uint8_t *g_romData = NULL;
+ uint32_t g_romSize = 0;
+@@ -106,7 +107,7 @@ int platformInitRom(const char *path) {
+         return -1;
+     }
+     /* --- 1. Size (byte-order independent, so it can be checked first). ------ */
+-    if (size != DKR_ROM_SIZE_BYTES) {
++    if (size != DKR_ROM_SIZE_BYTES && size != DKR_ROM_SIZE_BYTES_EXT) {
+         fprintf(stderr,
+                 "[ROM] %s is %ld bytes; a Diddy Kong Racing ROM must be exactly "
+                 "%d bytes (12 MB). Wrong game, headered dump, or truncated file.\n",
+@@ -235,11 +236,52 @@ int platformInitRom(const char *path) {
+         printf("[ROM] CRC1 %08X CRC2 %08X\n", id->crc1, id->crc2);
+     }
+ 
++    gMdkrPtBr = (g_romSize >= 0x40u && memcmp(g_romData + 0x20, "DKR BR", 6) == 0);
++    if (gMdkrPtBr) {
++        printf("[ROM] PT-BR translation detected: hardcoded texts are swapped at draw time\n");
++    }
+     printf("[ROM] Loaded %u bytes (%.1f MB) from %s\n",
+            g_romSize, (float)g_romSize / (1024.0f * 1024.0f), path);
+     return 0;
+ }
+ 
++/* dkr360: the PT-BR translation (Dream64) keeps the texts that the C code hardcodes (credits titles, place
++ * ordinals, "CAN'T SAVE GHOST", RACE/LAP...) in its own copy of the game code, which Golden Balloon does not
++ * run. So when the loaded ROM is that translation, those literals are swapped at draw time (font.c). The
++ * punctuation inside the Portuguese strings ($ @ ) ( < & *) is that translation's own accent-glyph encoding. */
++int gMdkrPtBr = 0;
++static const char *const kPtBrText[][2] = {
++    { "CREDITS", "CR&DITOS" }, { "Software Director", "Diretor de Software" },
++    { "Software Engineers", "Engenheiros de Software" }, { "Art Director", "Diretor de Arte" },
++    { "3D Artists", "Artistas 3D" }, { "Music", "M)usica" }, { "Sound Effects", "Efeitos Sonoros" },
++    { "ALSO", "E TEM MAIS" }, { "Additional Design", "Designer Adicional" },
++    { "Documentation", "Documenta$@ao" }, { "Liaison", "Liga$@ao" }, { "Liason", "Liga$@ao" },
++    { "Character Voices", "Vozes dos Personagens" }, { "Rare Quality Assurance", "Garantia de Qualidade Rare" },
++    { "NOA Thanks To", "NOA Agradecimentos para" }, { "NCL Thank You's", "NCL Agradece a voc<e" },
++    { "NOE Thank You's", "NOE Agradece a voc<e" }, { "Special Thanks To", "Agradecimentos Especiais para" },
++    { "Game Director", "Diretor do Jogo" }, { "Producer", "Produtor" }, { "Executive Producer", "Produtor Executivo" },
++    { "THE END?", "FIM?" }, { "TO BE CONTINUED ...", "CONTINUA ..." }, { "THE END", "FIM" },
++    { "NO CHEAT", "SEM TRAPA$A" }, { "THIS TIME.", "ESSE TEMPO." },
++    { "1st", "1*" }, { "2nd", "2*" }, { "3rd", "3*" }, { "4th", "4*" }, { "5th", "5*" }, { "6th", "6*" },
++    { "7th", "7*" }, { "8th", "8*" }, { "1ST", "1*" }, { "2ND", "2*" }, { "3RD", "3*" }, { "4TH", "4*" },
++    { "5TH", "5*" }, { "6TH", "6*" }, { "7TH", "7*" }, { "8TH", "8*" },
++    { "CAN'T", "N@AO PODE" }, { "SAVE", "SALVAR" }, { "GHOST", "FANTASMA" }, { " CONTROLLER", " CONTROLE" },
++    { "PAK", "PAK EST(A" }, { "FULL", "CHEIO" }, { "DAMAGED", "DANIFICADO" },
++    { "RACE", "CORRIDA" }, { "LAP", "VOLTA" }, { "DID NOT FINISH", "N@AO TERMINOU" },
++};
++const char *mdkr_pt_text(const char *text) {
++    size_t i;
++    if (!gMdkrPtBr || text == NULL || text[0] == '\0') {
++        return text;
++    }
++    for (i = 0; i < sizeof(kPtBrText) / sizeof(kPtBrText[0]); i++) {
++        if (kPtBrText[i][0][0] == text[0] && strcmp(kPtBrText[i][0], text) == 0) {
++            return kPtBrText[i][1];
++        }
++    }
++    return text;
++}
++
+ int platform_rom_read(uint32_t romOffset, void *dst, int32_t len) {
+     uint64_t end;
+ 
+diff --git a/platform/rom_validation.c b/platform/rom_validation.c
+index c14688cf..cd92be89 100644
+--- a/platform/rom_validation.c
++++ b/platform/rom_validation.c
+@@ -80,7 +80,7 @@ int dkr_rom_validate_image(uint8_t *data, uint32_t size,
+     out->code = DKR_ROM_VALIDATION_WRONG_SIZE;
+     snprintf(out->byteOrder, sizeof(out->byteOrder), "%s", "???");
+ 
+-    if (data == NULL || size != DKR_ROM_SIZE_BYTES) {
++    if (data == NULL || (size != DKR_ROM_SIZE_BYTES && size != DKR_ROM_SIZE_BYTES_EXT)) {
+         if (size < 1024u * 1024u) {
+             snprintf(out->message, sizeof(out->message),
+                      "%s is only %u bytes; a Diddy Kong Racing ROM must be "
+@@ -107,6 +107,9 @@ int dkr_rom_validate_image(uint8_t *data, uint32_t size,
+     snprintf(out->byteOrder, sizeof(out->byteOrder), "%s", order);
+ 
+     dkr_rom_identify(data, &out->id);
++    if (size == DKR_ROM_SIZE_BYTES_EXT && out->id.romEnd != 0u) {
++        out->id.romEnd = size; /* expanded (translated) ROM: assets reach further than the stock layout */
++    }
+     if (out->id.verdict != DKR_ROM_SUPPORTED && !policy->allowAnyRevision) {
+         out->code = DKR_ROM_VALIDATION_UNSUPPORTED_REVISION;
+         dkr_rom_describe(&out->id, name, out->message, sizeof(out->message));
+diff --git a/platform/rom_validation.h b/platform/rom_validation.h
+index 675c3fde..4d124f76 100644
+--- a/platform/rom_validation.h
++++ b/platform/rom_validation.h
+@@ -20,6 +20,8 @@ extern "C" {
+ #endif
+ 
+ #define DKR_ROM_SIZE_BYTES 0x00C00000u
++/* Translated ROMs (PT-BR hack) grow past 12 MB; dkr360 pads them to 16 MB with 0xFF. */
++#define DKR_ROM_SIZE_BYTES_EXT 0x01000000u
+ 
+ typedef enum {
+     DKR_ROM_VALIDATION_OK = 0,
 diff --git a/platform/stubs_dkr.c b/platform/stubs_dkr.c
 index 3f8d22f2..7ea3dd0a 100644
 --- a/platform/stubs_dkr.c

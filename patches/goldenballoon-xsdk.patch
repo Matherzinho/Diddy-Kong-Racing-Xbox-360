@@ -1077,6 +1077,240 @@ index 7c42adea..9019f874 100644
  }
  
  void gfx_dkr_replay_invalidate(void) {
+diff --git a/platform/fast3d/gfx_presentation_packet.c b/platform/fast3d/gfx_presentation_packet.c
+index a8986f26..69b9b2e9 100644
+--- a/platform/fast3d/gfx_presentation_packet.c
++++ b/platform/fast3d/gfx_presentation_packet.c
+@@ -18,8 +18,81 @@ typedef struct PacketList {
+     PacketEntry *entries;
+     size_t count;
+     size_t capacity;
++    /* dkr360: pointer-keyed hash index (keys are unique per list). Every site that sets count to anything but "one
++     * more" marks it dirty (LIST_CLEAR / list_freeze). */
++    uint32_t *idx;
++    uint32_t idx_cap;
++    size_t idx_built;
++    int idx_dirty;
+ } PacketList;
+ 
++static inline uint32_t pk_hash(const void *key) {
++    return ((uint32_t)((uintptr_t)key >> 3) * 2654435761u) >> 7;
++}
++
++static void list_index_sync(PacketList *l) {
++    size_t i;
++    uint32_t mask;
++    if (l->idx_dirty || l->idx_built > l->count) {
++        l->idx_built = 0;
++        l->idx_dirty = 0;
++        if (l->idx != NULL) {
++            memset(l->idx, 0, (size_t)l->idx_cap * sizeof(*l->idx));
++        }
++    }
++    if (l->idx_cap < 64u || (size_t)l->idx_cap < l->count * 2u) {
++        uint32_t cap = l->idx_cap < 64u ? 64u : l->idx_cap;
++        uint32_t *tab;
++        while ((size_t)cap < l->count * 2u) {
++            cap <<= 1;
++        }
++        tab = (uint32_t *)calloc(cap, sizeof(*tab));
++        if (tab == NULL) {
++            l->idx_dirty = 1;
++            return;
++        }
++        free(l->idx);
++        l->idx = tab;
++        l->idx_cap = cap;
++        l->idx_built = 0;
++    }
++    mask = l->idx_cap - 1u;
++    for (i = l->idx_built; i < l->count; i++) {
++        uint32_t slot = pk_hash(l->entries[i].key) & mask;
++        while (l->idx[slot] != 0u && l->entries[l->idx[slot] - 1u].key != l->entries[i].key) {
++            slot = (slot + 1u) & mask;
++        }
++        l->idx[slot] = (uint32_t)i + 1u;
++    }
++    l->idx_built = l->count;
++}
++
++/* the index of the entry holding key, or -1 */
++static long list_index_find(PacketList *l, const void *key) {
++    uint32_t mask, slot;
++    list_index_sync(l);
++    if (l->idx == NULL || l->idx_dirty) {
++        for (size_t index = l->count; index > 0u; index--) {
++            if (l->entries[index - 1u].key == key) {
++                return (long)(index - 1u);
++            }
++        }
++        return -1;
++    }
++    mask = l->idx_cap - 1u;
++    slot = pk_hash(key) & mask;
++    while (l->idx[slot] != 0u) {
++        const uint32_t i = l->idx[slot] - 1u;
++        if (l->entries[i].key == key) {
++            return (long)i;
++        }
++        slot = (slot + 1u) & mask;
++    }
++    return -1;
++}
++
++#define LIST_CLEAR(list) do { (list).count = 0u; (list).idx_dirty = 1; } while (0)
++
+ typedef struct DeformationEntry {
+     const void *owner_address;
+     uint64_t owner_generation;
+@@ -415,10 +488,10 @@ static bool list_register(PacketList *list, const void *key, size_t key_size,
+         !owner->valid || owner->address == NULL || owner->generation == 0u) {
+         return false;
+     }
+-    for (size_t index = list->count; index > 0u; index--) {
+-        if (list->entries[index - 1u].key == key) {
+-            entry = &list->entries[index - 1u];
+-            break;
++    {
++        const long found_index = list_index_find(list, key);
++        if (found_index >= 0) {
++            entry = &list->entries[found_index];
+         }
+     }
+     if (entry == NULL) {
+@@ -672,12 +745,14 @@ static bool list_freeze(PacketList *frozen, const PacketList *live) {
+     if (live->count != 0u) {
+         if (!list_grow(frozen, live->count)) {
+             frozen->count = 0u;
++            frozen->idx_dirty = 1;
+             return false;
+         }
+         memcpy(frozen->entries, live->entries,
+                live->count * sizeof(*frozen->entries));
+     }
+     frozen->count = live->count;
++    frozen->idx_dirty = 1;
+     return true;
+ }
+ 
+@@ -720,11 +795,11 @@ void gfx_presentation_packet_freeze(void) {
+         ok = false;
+     }
+ 
+-    s_live_matrices.count = 0u;
+-    s_live_vertices.count = 0u;
++    LIST_CLEAR(s_live_matrices);
++    LIST_CLEAR(s_live_vertices);
+     if (!ok) {
+-        s_frozen_matrices.count = 0u;
+-        s_frozen_vertices.count = 0u;
++        LIST_CLEAR(s_frozen_matrices);
++        LIST_CLEAR(s_frozen_vertices);
+         s_frozen_valid = false;
+         s_stats.freeze_failures++;
+         s_stats.frozen_matrices = 0u;
+@@ -739,8 +814,8 @@ void gfx_presentation_packet_freeze(void) {
+         ok = false;
+     }
+     if (!ok) {
+-        s_frozen_matrices.count = 0u;
+-        s_frozen_vertices.count = 0u;
++        LIST_CLEAR(s_frozen_matrices);
++        LIST_CLEAR(s_frozen_vertices);
+         s_frozen_valid = false;
+         s_stats.freeze_failures++;
+         s_stats.frozen_matrices = 0u;
+@@ -766,10 +841,12 @@ static bool list_lookup(const PacketList *list, const void *key,
+         (*misses)++;
+         return false;
+     }
+-    for (size_t index = list->count; index > 0u; index--) {
+-        const PacketEntry *entry = &list->entries[index - 1u];
+-        if (entry->key != key) {
+-            continue;
++    {
++        const long found_index = list_index_find((PacketList *)list, key);
++        const PacketEntry *entry =
++            found_index >= 0 ? &list->entries[found_index] : NULL;
++        if (entry == NULL) {
++            goto lookup_miss;
+         }
+         if (entry->binding.key_size != 0u &&
+             (force_dependency_rewrite(matrix) ||
+@@ -786,6 +863,7 @@ static bool list_lookup(const PacketList *list, const void *key,
+         (*hits)++;
+         return true;
+     }
++lookup_miss:
+     (*misses)++;
+     return false;
+ }
+@@ -821,18 +899,18 @@ bool gfx_presentation_packet_lookup_live_vertex(
+     if (key == NULL || out == NULL) {
+         return false;
+     }
+-    for (size_t index = s_live_vertices.count; index > 0u; index--) {
+-        const PacketEntry *entry = &s_live_vertices.entries[index - 1u];
+-        if (entry->key != key) {
+-            continue;
+-        }
+-        if (entry->binding.key_size != 0u &&
+-            memcmp(entry->binding.key_bytes, key,
+-                   entry->binding.key_size) != 0) {
+-            return false;
++    {
++        const long found_index = list_index_find(&s_live_vertices, key);
++        if (found_index >= 0) {
++            const PacketEntry *entry = &s_live_vertices.entries[found_index];
++            if (entry->binding.key_size != 0u &&
++                memcmp(entry->binding.key_bytes, key,
++                       entry->binding.key_size) != 0) {
++                return false;
++            }
++            *out = entry->binding;
++            return true;
+         }
+-        *out = entry->binding;
+-        return true;
+     }
+     return false;
+ }
+@@ -841,12 +919,7 @@ static bool list_contains_key(const PacketList *list, const void *key) {
+     if (list == NULL || key == NULL) {
+         return false;
+     }
+-    for (size_t index = list->count; index > 0u; index--) {
+-        if (list->entries[index - 1u].key == key) {
+-            return true;
+-        }
+-    }
+-    return false;
++    return list_index_find((PacketList *)list, key) >= 0;
+ }
+ 
+ bool gfx_presentation_packet_has_live_vertex(const void *key) {
+@@ -1154,15 +1227,15 @@ void gfx_presentation_packet_note_endpoint_semantic(
+ }
+ 
+ void gfx_presentation_packet_discard_live_registrations(void) {
+-    s_live_matrices.count = 0u;
+-    s_live_vertices.count = 0u;
++    LIST_CLEAR(s_live_matrices);
++    LIST_CLEAR(s_live_vertices);
+ }
+ 
+ void gfx_presentation_packet_invalidate(void) {
+-    s_live_matrices.count = 0u;
+-    s_live_vertices.count = 0u;
+-    s_frozen_matrices.count = 0u;
+-    s_frozen_vertices.count = 0u;
++    LIST_CLEAR(s_live_matrices);
++    LIST_CLEAR(s_live_vertices);
++    LIST_CLEAR(s_frozen_matrices);
++    LIST_CLEAR(s_frozen_vertices);
+     s_frozen_valid = false;
+     s_deform_live.count = 0u;
+     s_deform_current.count = 0u;
 diff --git a/platform/fast3d/gfx_retained_task.c b/platform/fast3d/gfx_retained_task.c
 index 17cf8b9a..dcf442be 100644
 --- a/platform/fast3d/gfx_retained_task.c
@@ -1246,6 +1480,182 @@ index 17cf8b9a..dcf442be 100644
      next.original_arena = s_capture.arena;
      next.arena_size = s_capture.arena_size;
      next.authored_tick = s_capture.authored_tick;
+diff --git a/platform/fast3d/gfx_shadow_frame.c b/platform/fast3d/gfx_shadow_frame.c
+index 4750f2c2..f0c31b81 100644
+--- a/platform/fast3d/gfx_shadow_frame.c
++++ b/platform/fast3d/gfx_shadow_frame.c
+@@ -96,6 +96,80 @@ static uint64_t s_generation;
+ static GfxShadowMatrixEntry *s_matrix_entries;
+ static size_t s_matrix_count;
+ static size_t s_matrix_capacity;
++/* dkr360: pointer-keyed hash index over s_matrix_entries (keys are unique: registration updates an existing key). The
++ * linear scans it replaces ran once per G_MTX of every walk and replay, and once per registration, over entries of
++ * some 300 bytes each. Every place that sets s_matrix_count to anything but "one more" marks it dirty. */
++static uint32_t *s_midx_tab;
++static uint32_t s_midx_cap;
++static size_t s_midx_built;
++static int s_midx_dirty = 1;
++
++static inline uint32_t midx_hash(const void *key) {
++    return ((uint32_t)((uintptr_t)key >> 3) * 2654435761u) >> 7;
++}
++
++static void midx_sync(void) {
++    size_t i;
++    uint32_t mask;
++    if (s_midx_dirty || s_midx_built > s_matrix_count) {
++        s_midx_built = 0;
++        s_midx_dirty = 0;
++        if (s_midx_tab != NULL) {
++            memset(s_midx_tab, 0, (size_t)s_midx_cap * sizeof(*s_midx_tab));
++        }
++    }
++    if (s_midx_cap < 64u || (size_t)s_midx_cap < s_matrix_count * 2u) {
++        uint32_t cap = s_midx_cap < 64u ? 64u : s_midx_cap;
++        uint32_t *tab;
++        while ((size_t)cap < s_matrix_count * 2u) {
++            cap <<= 1;
++        }
++        tab = (uint32_t *)calloc(cap, sizeof(*tab));
++        if (tab == NULL) {
++            s_midx_dirty = 1;
++            return;
++        }
++        free(s_midx_tab);
++        s_midx_tab = tab;
++        s_midx_cap = cap;
++        s_midx_built = 0;
++    }
++    mask = s_midx_cap - 1u;
++    for (i = s_midx_built; i < s_matrix_count; i++) {
++        uint32_t slot = midx_hash(s_matrix_entries[i].key) & mask;
++        while (s_midx_tab[slot] != 0u &&
++               s_matrix_entries[s_midx_tab[slot] - 1u].key != s_matrix_entries[i].key) {
++            slot = (slot + 1u) & mask;
++        }
++        s_midx_tab[slot] = (uint32_t)i + 1u;
++    }
++    s_midx_built = s_matrix_count;
++}
++
++/* the index of the entry holding key, or -1 */
++static long midx_find(const void *key) {
++    uint32_t mask, slot;
++    midx_sync();
++    if (s_midx_tab == NULL || s_midx_dirty) {
++        /* no index (out of memory): the old linear scan */
++        for (size_t index = s_matrix_count; index > 0; index--) {
++            if (s_matrix_entries[index - 1].key == key) {
++                return (long)(index - 1);
++            }
++        }
++        return -1;
++    }
++    mask = s_midx_cap - 1u;
++    slot = midx_hash(key) & mask;
++    while (s_midx_tab[slot] != 0u) {
++        const uint32_t i = s_midx_tab[slot] - 1u;
++        if (s_matrix_entries[i].key == key) {
++            return (long)i;
++        }
++        slot = (slot + 1u) & mask;
++    }
++    return -1;
++}
+ static GfxShadowStaticCache s_static_cache;
+ static const void **s_projected_ranges;
+ static size_t s_projected_range_count;
+@@ -722,8 +796,10 @@ bool gfx_shadow_matrix_register(
+         !finite_matrix(view_projection)) {
+         return false;
+     }
+-    for (size_t index = 0; index < s_matrix_count; index++) {
+-        if (s_matrix_entries[index].key == key) {
++    {
++        const long found_index = midx_find(key);
++        if (found_index >= 0) {
++            const size_t index = (size_t)found_index;
+             memcpy(s_matrix_entries[index].binding.world, world,
+                    sizeof(s_matrix_entries[index].binding.world));
+             memcpy(s_matrix_entries[index].binding.view_projection,
+@@ -866,10 +942,10 @@ bool gfx_shadow_matrix_lookup(
+         s_stats.matrix_lookup_misses++;
+         return false;
+     }
+-    for (size_t index = s_matrix_count; index > 0; index--) {
+-        const GfxShadowMatrixEntry *entry = &s_matrix_entries[index - 1];
+-        if (entry->key == key) {
+-            *out = entry->binding;
++    {
++        const long found_index = midx_find(key);
++        if (found_index >= 0) {
++            *out = s_matrix_entries[found_index].binding;
+             s_stats.matrix_lookup_hits++;
+             return true;
+         }
+@@ -884,21 +960,22 @@ bool gfx_shadow_matrix_note_walked_key(
+         size != sizeof(((GfxShadowMatrixBinding *)0)->walked_key_bytes)) {
+         return false;
+     }
+-    for (size_t index = s_matrix_count; index > 0; index--) {
+-        GfxShadowMatrixEntry *entry = &s_matrix_entries[index - 1];
+-        if (entry->key != key) {
+-            continue;
++    {
++        const long found_index = midx_find(key);
++        if (found_index >= 0) {
++            GfxShadowMatrixEntry *entry = &s_matrix_entries[found_index];
++            memcpy(entry->binding.walked_key_bytes, bytes,
++                   sizeof(entry->binding.walked_key_bytes));
++            entry->binding.walked_key_bytes_valid = true;
++            return true;
+         }
+-        memcpy(entry->binding.walked_key_bytes, bytes,
+-               sizeof(entry->binding.walked_key_bytes));
+-        entry->binding.walked_key_bytes_valid = true;
+-        return true;
+     }
+     return false;
+ }
+ 
+ void gfx_shadow_matrix_registry_reset(void) {
+     s_matrix_count = 0;
++    s_midx_dirty = 1;
+     s_stats.matrix_entries = 0;
+ }
+ 
+@@ -1103,6 +1180,7 @@ bool gfx_shadow_replay_restore(
+                s_frozen_matrix_count * sizeof(*s_matrix_entries));
+     }
+     s_matrix_count = s_frozen_matrix_count;
++    s_midx_dirty = 1;
+     s_stats.matrix_entries = s_matrix_count;
+ 
+     if (s_frozen_projected_range_count != 0) {
+@@ -1236,6 +1314,7 @@ void gfx_shadow_camera_endpoint_validate(
+  */
+ static bool replay_release_abort(void) {
+     s_matrix_count = 0;
++    s_midx_dirty = 1;
+     s_stats.matrix_entries = 0;
+     s_projected_range_count = 0;
+     s_excluded_caster_count = 0;
+@@ -1258,6 +1337,7 @@ bool gfx_shadow_replay_release(void) {
+                s_displaced_matrix_count * sizeof(*s_matrix_entries));
+     }
+     s_matrix_count = s_displaced_matrix_count;
++    s_midx_dirty = 1;
+     s_stats.matrix_entries = s_matrix_count;
+ 
+     if (s_displaced_projected_range_count != 0) {
+@@ -1960,6 +2040,7 @@ void gfx_shadow_frame_shutdown(void) {
+     free(s_matrix_entries);
+     s_matrix_entries = NULL;
+     s_matrix_count = 0;
++    s_midx_dirty = 1;
+     s_matrix_capacity = 0;
+     free(s_static_cache.vertices);
+     free(s_static_cache.ranges);
 diff --git a/platform/host_sched_probe.c b/platform/host_sched_probe.c
 index ecc8a0c5..fa9342ee 100644
 --- a/platform/host_sched_probe.c
@@ -1327,7 +1737,7 @@ index 3749180c..28b416d9 100644
  #error "online OS tag unmapped for this platform: prove its gameplay \
  determinism domain and add it here (and to the pinned unit vectors) before \
 diff --git a/platform/platform_sdl_min.c b/platform/platform_sdl_min.c
-index 952ac542..3490e11f 100644
+index 952ac542..07c761ee 100644
 --- a/platform/platform_sdl_min.c
 +++ b/platform/platform_sdl_min.c
 @@ -35,6 +35,13 @@
@@ -1559,11 +1969,11 @@ index 952ac542..3490e11f 100644
 +    static int64_t cached = -1;
 +    if (cached < 0) {
 +        const char *value = getenv("MDKR_PRESENT_ENDPOINT_LEAD_US");
-+        unsigned long parsed = 7000ul;
++        unsigned long parsed = 11000ul;
 +        if (value != NULL && value[0] != '\0') {
 +            char *end = NULL;
 +            const unsigned long p = strtoul(value, &end, 10);
-+            if (end != NULL && *end == '\0' && p <= 12000ul) {
++            if (end != NULL && *end == '\0' && p <= 14000ul) {
 +                parsed = p;
 +            }
 +        }

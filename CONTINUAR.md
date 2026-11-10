@@ -216,3 +216,25 @@ existe também no xsdk (`s_xsdkEndpointSlotNs`): o wake que torna o tick devido 
 `platform_present_endpoint_gate` segura a imagem até o slot. Log `lead:` a cada 300 ticks mostra quantos estouraram o lead.
 Xenia: 60 fps, quadro de corrida igual (tempo de corrida ±0,1 s). Não medido no console.
 Se o hub ainda perder vblanks: diminuir walk/replay (VMX no G_VTX/G_TRIN; replay compartilhando cálculo do walk).
+
+
+## Teste 7 — lead 11 ms
+
+Log do teste 6 (hub e pistas): `lead:` mostra 300/300 ticks estourando 7 ms, média de estouro 6–8 ms nas janelas boas (0
+vblanks perdidos) e 13–15 ms nas ruins (22–38 perdidos): o compute do tick no hub é ~20 ms. Lead padrão subiu para 11 ms
+(máx. 14, `dkr360_lead.txt`). Janelas com `worst` de 46–590 ms são carregamento de pista, não do pacer. Perdidos no log do
+teste 6: 755/46376 vblanks (1,6%, em sessão com mais pistas pesadas que a do teste 5, 0,8%). Medir o teste 7 igual.
+
+
+## Teste 8 — buscas lineares viraram hash
+
+Log do teste 7 (console): nível 28 e hub com walk 370 + replay 290 ms/s e jogo 220 (pace ~20: CPU saturada, 52 fps); ~1,3 mil
+ciclos por triângulo. Achado no código: `gfx_shadow_matrix_lookup`/registro (gfx_shadow_frame.c, entradas de ~300 B,
+uma busca linear por G_MTX de cada walk/replay e uma por registro de matriz por quadro = O(N²)) e as listas do
+`gfx_presentation_packet.c` (`list_lookup`, `lookup_live_vertex`, `list_register`, `has_*_vertex`) varriam tudo por G_VTX.
+Agora índice hash por ponteiro (chaves únicas), reconstruído quando a lista é zerada/restaurada (`s_midx_dirty`,
+`LIST_CLEAR`). Xenia, hub: µs por walk 4190 -> 3369 (-20%), jogo 65 -> 55 ms/s, imagem do hub igual (inspeção visual; o hub
+não é determinístico entre execuções). Não resolvido: `scan` (varredura da DL do tick, ~100 ms/s no console), busca linear em
+`uv_scroll_find`/`deformation_find` (pequenas), carregamento de pista (travadas de 0,5 s), custo por triângulo.
+Teste de hub no Xenia: autopad = `tests/input_scripts/adventure_hub_drive.txt` sem comentários; ele grava save em
+`dkr360\saves` e a segunda execução trava no menu se o save existir (mover a pasta antes). `tools/profsum.py <log> N`.
